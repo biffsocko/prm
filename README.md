@@ -1,0 +1,41 @@
+# PRM — Private Relay Messaging
+
+A high-speed, auth-required chat relay built for LLM-powered bots as first-class citizens. Similar shape to IRC — server, channels, identities, private messages — but a fresh wire protocol and modern primitives throughout.
+
+**Status:** design phase. No implementation yet. See [DESIGN.md](DESIGN.md) for the architecture.
+
+## Why PRM exists
+
+Running an LLM-powered bot on top of a traditional chat protocol (IRC, Matrix, even Discord/Slack via gateways) has a quiet but expensive problem: **the bot has to look at every message to decide whether to respond.** Even when a regex would have ruled most messages out, the bot is typically built to call the model for "should I respond? what should I say?" — and that call costs tokens whether the model decides to respond or not.
+
+PRM moves the filter to the server. Bots register **subscriptions** that say "POST me when channel `#ops` gets a message matching `/^deploy/i`" or "when `@alertbot` is mentioned anywhere." The server runs the filter, fires a webhook only on matches, and includes a configurable window of preceding channel context in the payload. The bot's LLM only ever sees pre-qualified messages — and it gets them with context already attached, in one HTTP POST, with no persistent connection to maintain.
+
+This compounds well:
+
+- **No persistent connection** — bots can be serverless functions (Lambda, Cloudflare Workers, Cloud Run) that wake only when a trigger fires. No idle cost, no reconnect logic, no scrollback to manage.
+- **Pre-attached context** — when a webhook fires, the payload includes the matching message *plus* N preceding messages of channel context. The bot doesn't fetch separately or maintain its own ring buffer. One webhook = one LLM call with everything needed.
+- **Debounce window** — multiple matches inside a short window collapse into a single fire. A 10-message burst of `@bot` mentions becomes one LLM call, not ten.
+- **Server-side cooldown** — per-subscription rate limits prevent thrashing on tight back-and-forths.
+- **Budget caps** — a subscription can declare "I cost roughly $0.02 per fire" and the server enforces an hourly/daily ceiling. Hobby bots on metered LLM accounts stop getting fired past the budget, instead of burning through it during a busy day.
+
+For a bot that previously processed 50,000 channel messages a day and only needed to respond to ~200 of them, the LLM-token reduction is roughly **two orders of magnitude** — you stop paying the model to decide "no" 49,800 times.
+
+## What PRM is *not*
+
+- **Not IRC-compatible.** Existing IRC clients (irssi, weechat, hexchat) will not connect. PRM uses a different wire protocol; you need a PRM client.
+- **Not federated.** Single server topology in v0. No server-to-server linking.
+- **Not anonymous.** Every connection authenticates. No anonymous join under any setting; the `public` channel visibility just means "any authenticated account may join."
+- **Not a message archive (yet).** v0 does not persist chat history. Messages exist in memory for the lifetime of an active channel. Chat history persistence and the `chathistory`-equivalent retrieval API are deferred to v1.
+
+## Project shape (when implementation lands)
+
+Two binaries in one Go module:
+
+- `prmd` — the server
+- `prm` — a TUI reference client
+
+Single-binary deploys. SQLite for accounts, channels, ACLs, and webhook subscriptions. TLS-only on the wire. WebSocket Upgrade supported on the same port so browser clients can connect without a separate gateway.
+
+## License
+
+TBD when first code lands.
