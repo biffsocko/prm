@@ -145,6 +145,123 @@ When a frame on the channel matches `any_of`:
 
 Webhook delivery runs on a separate worker pool. **It never blocks the realtime fan-out path.**
 
+## Inbound integrations
+
+PRM is not a log platform, an alert engine, or an event store. It is the *bot orchestration layer* on top of those systems. To make events from external tools show up as PRM channel events — so bots can subscribe to them with the same model as chat messages — PRM exposes a small inbound webhook API.
+
+### The pattern
+
+```
+POST /v1/inbound/{integration_id}
+Authorization: Bearer <integration-token>
+Content-Type: application/json
+```
+
+- `integration_id` is created once via the REST control plane (`POST /v1/integrations`) and is bound to:
+  - A channel that received events will be republished to
+  - An adapter (`splunk` | `graylog` | `datadog` | `github` | `generic` | …)
+  - A scoped API token shown exactly once at creation time
+- The handler receives whatever JSON the calling system sends, runs the adapter's normalize function, republishes the result as a PRM `event` message on the bound channel, and returns `202 Accepted`.
+- All downstream behavior — webhook subscriptions, debounce, cooldown, budget caps, context attach — is unchanged. The event looks like any other channel message to a bot.
+
+### Adapter contract
+
+```go
+type Adapter interface {
+    Name() string
+    Normalize(body []byte, headers http.Header) (Event, error)
+}
+
+type Event struct {
+    Source     string         // e.g. "splunk", "graylog"
+    Service    string         // e.g. "auth-api"
+    Severity   string         // "info" | "warn" | "error" | "critical"
+    Summary    string         // short human-readable line
+    Fields     map[string]any // structured fields preserved from upstream
+    OccurredAt time.Time      // upstream timestamp if present, else now
+    Raw        json.RawMessage // original payload, for debugging
+}
+```
+
+Adapters are stateless. New integrations add an adapter file in `internal/inbound/adapters/` and register it on startup. No protocol changes required.
+
+### Splunk adapter
+
+Splunk's Webhook alert action posts JSON of this shape:
+
+```json
+{
+  "sid": "scheduler__admin__...",
+  "search_name": "Auth API 5xx Spike",
+  "app": "search",
+  "owner": "admin",
+  "results_link": "https://splunk.example.com/...",
+  "result": { "status_code": "503", "service": "auth-api", "count": "47" }
+}
+```
+
+Normalize maps:
+
+- `Source` → `"splunk"`
+- `Service` → `result.service` (JSON path is configurable per integration)
+- `Summary` → `search_name`, optionally interpolated with `result` fields (e.g. `"{search_name}: {result.count} 5xx in window"`)
+- `Severity` → derived from search-name conventions or an explicit `severity` field on the search results; defaults to `warning`
+- `Fields` → the entire `result` object plus `results_link`
+- `OccurredAt` → `now()` (Splunk's payload doesn't include a reliable trigger timestamp)
+
+### Graylog adapter
+
+Graylog's HTTP Notification (Event Definitions) posts JSON:
+
+```json
+{
+  "event_definition_id": "...",
+  "event_definition_type": "aggregation-v1",
+  "event_definition_title": "Auth API error rate",
+  "event": {
+    "timestamp": "2026-05-16T12:30:01.000Z",
+    "message": "Auth API error rate > 5/min",
+    "fields": { "service": "auth-api", "level": "ERROR" },
+    "priority": 3
+  }
+}
+```
+
+Normalize maps:
+
+- `Source` → `"graylog"`
+- `Service` → `event.fields.service`
+- `Summary` → `event.message` (falls back to `event_definition_title`)
+- `Severity` → translation of `event.priority` (Graylog uses 1=low / 2=normal / 3=high → PRM `info` / `warning` / `error`)
+- `Fields` → `event.fields`
+- `OccurredAt` → `event.timestamp`
+
+### Generic adapter
+
+For any system that can POST JSON — GitHub webhooks, Jenkins post-build hooks, Kubernetes Events, cron jobs, custom scripts. The generic adapter is configured at integration-creation time with:
+
+- JSON-path expressions for each `Event` field (e.g., `summary_path: "$.alert.title"`)
+- Optional severity mapping table
+- Optional pre-filter (skip events where a JSON path matches or doesn't match)
+
+This makes the long tail of "stuff that can POST JSON" trivially supported without writing Go code per source.
+
+### Security
+
+- Tokens are bearer tokens, hashed at rest with SHA-256, displayed exactly once at creation.
+- Tokens are scoped to one integration and one channel; revoking the token deletes the binding.
+- An optional **shared-secret signature** mode (`X-PRM-Signature: sha256=...`) is supported for callers that prefer HMAC over bearer tokens — matches GitHub's webhook signing style.
+- Per-integration rate limit: default 10 events/sec sustained, 100 burst. Configurable. Excess returns `429 Too Many Requests`.
+- Payload size cap: 64 KB by default. Larger payloads return `413 Payload Too Large`; an adapter can opt into a higher cap.
+
+### Why this is strictly better than "PRM is also a log platform"
+
+- **Zero observability code to maintain.** No parsers, indexers, retention tiers, query languages. The existing platforms already do that better than PRM ever would.
+- **Works with whatever the user already has.** No migration required. Drop the inbound URL into Splunk's alert action and you're done.
+- **One mental model for bot authors.** Chat message, log alert, GitHub PR, deploy notification — all look the same to a subscription rule. Same match shape, same payload-with-context, same LLM-cost story.
+- **Reuses the entire PRM stack.** No new auth model, no new storage decisions, no new retention policy.
+- **Sharpens the bot pitch.** PRM isn't competing with Splunk; it's the layer that lets an LLM bot triage Splunk's alerts with chat-channel context attached.
+
 ## Cost savings model
 
 The first-order win is filter pushdown: the server's regex match is free relative to a model call, and most messages don't match anything.

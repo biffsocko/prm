@@ -43,8 +43,10 @@ prm/
     auth/                  # Argon2id password hashing, token issuance/verification, SASL flow
     channels/              # in-memory channel state, sharded locks, member list ops
     storage/               # SQLite schema, account/channel/ACL/subscription persistence
-    rest/                  # HTTP control plane (account/channel/subscription CRUD)
+    rest/                  # HTTP control plane (account/channel/subscription/integration CRUD)
     webhook/               # subscription matcher, debounce buffer, signed HTTP POST worker pool
+    inbound/               # inbound integration receiver: POST /v1/inbound/{id} handler + adapter registry
+      adapters/            # per-source normalizers (splunk, graylog, datadog, github, generic, ...)
     client/                # shared client TUI components
   test/
     e2e/                   # multi-process integration tests
@@ -78,6 +80,8 @@ If you're tempted to change anything in this list, that's the conversation, not 
 
 - **Don't block fan-out on storage.** Channel ACLs are checked at JOIN time and cached in the in-memory channel state. Message delivery never touches SQLite.
 - **Don't put webhook delivery inline.** Even a 5ms HTTP roundtrip ruins fan-out latency if it's in the hot path. Worker pool, always.
+- **Inbound integration adapters are stateless.** A `Normalize(body, headers) → Event` function. No DB lookups, no outbound calls. If a source needs enrichment, do it in the bot that subscribes, not in the adapter.
+- **Don't turn PRM into a log platform.** Inbound integrations exist so PRM can *consume* events from Splunk / Graylog / Datadog / etc., not so PRM can replace them. If you find yourself adding storage, indexes, or a query language for ingested events, stop — that's a different product.
 - **Don't trust client-supplied timestamps.** Server stamps every message at receive. Anything else opens replay / spoofing surface.
 - **Don't make display names unique.** Two users named "alex" is fine; the `account_id` disambiguates. Resist anyone (including yourself in a future session) trying to add a uniqueness constraint.
 - **Don't add IRC compatibility.** The temptation will appear ("what if we just supported NICK/USER as aliases for the auth flow?"). Decline. PRM is its own protocol; IRC bridging is a separate project if anyone wants it.

@@ -20,6 +20,19 @@ This compounds well:
 
 For a bot that previously processed 50,000 channel messages a day and only needed to respond to ~200 of them, the LLM-token reduction is roughly **two orders of magnitude** — you stop paying the model to decide "no" 49,800 times.
 
+## Plugging in your existing tools
+
+PRM is not a log platform, alert engine, or event store — it's the *bot orchestration layer* that sits on top of them. To make events from Splunk, Graylog, Datadog, GitHub, CloudWatch, or anything else that can POST JSON show up as PRM events for bots to act on, point those systems at a small inbound webhook:
+
+```
+POST /v1/inbound/{integration_id}
+Authorization: Bearer <integration-token>
+```
+
+Per-source adapters (Splunk and Graylog ship as reference; a generic JSON-path adapter handles the long tail) normalize the payload, republish it as a PRM channel event, and the existing webhook subscription machinery — including the cost savings story above — drives whatever bots care to react. One mental model for chat messages, log alerts, GitHub PRs, deploy notifications.
+
+See [DESIGN.md](DESIGN.md#inbound-integrations) for the adapter contract and the Splunk / Graylog field mappings.
+
 ## How does PRM compare to Redis or RabbitMQ?
 
 Different problems, but the question comes up because both are commonly used as pub/sub layers for chat-adjacent systems. Quick guide:
