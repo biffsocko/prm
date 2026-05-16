@@ -241,6 +241,48 @@ Expected p50 fan-out from arrival → bytes-on-wire at all members: tens of micr
 - Message frames are pooled via `sync.Pool` of `[]byte` with capacity 4 KB. Frames larger than 4 KB allocate fresh.
 - JSON encoding uses a precomputed envelope template + `append` for hot fields, not `encoding/json` reflection, on the broadcast path. Inbound parse can use `encoding/json` since it's one-per-client.
 
+## Comparison to Redis and RabbitMQ
+
+These come up because both are commonly used as pub/sub layers for chat-adjacent systems. The honest comparison depends on what dimension you measure.
+
+### Raw publish-to-N-subscribers fan-out, single node
+
+- **Redis pub/sub**: tight C, single-threaded core, very small per-message path. Sub-100μs p50 on a LAN is typical. PRM with careful Go tuning can match this but probably won't beat it — JSON framing and Go GC are real costs Redis doesn't pay.
+- **RabbitMQ**: optimized for delivery guarantees, not latency. p50 is 1–10ms, higher with persistence. PRM will beat it on latency by skipping persistence, acks, exchange routing, and dead-letter queues.
+
+If your benchmark is `PUBLISH foo bar` → "subscriber reads bar," Redis wins.
+
+### End-to-end "chat message reaches all channel members"
+
+This is what PRM actually optimizes for, and it's not the same workload as raw pub/sub. PRM amortizes:
+
+- Serialize the broadcast frame once per inbound message.
+- Push precomputed bytes onto each member's outbound queue (sharded channel state, no global lock).
+- Each connection has its own write goroutine that drains the queue with `Writev` and TCP_NODELAY.
+
+Target: tens of microseconds p50 fan-out, low-ms p99 under load. Should be competitive with Redis here and well ahead of RabbitMQ.
+
+JSON framing cost: a 200-byte chat message is maybe 30% bigger than the RESP equivalent. For chat-shaped workloads (many connections, modest per-message rate per channel) wire bytes/sec is rarely the bottleneck. If it becomes one, the answer is binary framing in PRM, not abandoning PRM for a different broker.
+
+### Total system cost for an LLM-powered bot
+
+This is where the comparison stops being broker-vs-broker. Neither Redis nor RabbitMQ has server-side filter pushdown for bot subscriptions, debounce, cooldown, budget caps, or context attach. To build "IRC for bots" on top of either, you would:
+
+- **Redis pub/sub:** write a consumer that reads every message and filters in code. Back to paying tokens per message if your filter is the LLM, or maintaining your own filter logic. No durable subscription state; reconnect logic on you.
+- **RabbitMQ:** write a routing topology of exchanges and queues to pre-filter. Feasible, but you're spinning up one queue per bot per filter rule and managing the topology lifecycle.
+- **Either way:** write the webhook delivery worker pool, the debounce window, the per-subscription cooldown, the budget cap accounting, the signed payload format, the retry policy, and the per-bot context attach.
+
+PRM puts all of that in the server. The LLM-token savings documented in the "Cost savings model" section come from filtering happening *before* the bot's runtime ever sees the message, and that savings is independent of which underlying broker you'd otherwise pick. PRM packages the savings into the platform; Redis and RabbitMQ leave it as homework.
+
+### When to use Redis or RabbitMQ instead
+
+- **Service-to-service messaging between backend services.** PRM is the wrong tool. Use Redis (transient pub/sub) or RabbitMQ (durable queues).
+- **Need at-least-once delivery semantics with durable queues.** PRM doesn't do that in v0. Use RabbitMQ or Kafka.
+- **Need a generic key-value store, cache, or stream processing.** Redis or Kafka, obviously.
+- **Building a chat system with LLM-powered bots and you don't want to write the bot integration layer yourself.** PRM.
+
+The PRM bet is that "chat with bots as first-class users" is workload-specific enough to justify a purpose-built relay rather than building chat-plus-bot semantics on top of a generic broker.
+
 ## What's not designed yet
 
 Deliberately deferred to v1+ and not blocking v0 implementation:

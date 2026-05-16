@@ -20,6 +20,19 @@ This compounds well:
 
 For a bot that previously processed 50,000 channel messages a day and only needed to respond to ~200 of them, the LLM-token reduction is roughly **two orders of magnitude** — you stop paying the model to decide "no" 49,800 times.
 
+## How does PRM compare to Redis or RabbitMQ?
+
+Different problems, but the question comes up because both are commonly used as pub/sub layers for chat-adjacent systems. Quick guide:
+
+- **Redis pub/sub** is brutally fast at raw publish-to-N-subscribers fan-out — tight C, sub-100μs p50 on a LAN. For pure pub/sub throughput on a single node, Redis probably wins. PRM with careful Go tuning can match it but pays JSON framing and Go GC overhead Redis doesn't.
+- **RabbitMQ** optimizes for correctness (acks, persistence, dead-letter routing, exchanges) rather than latency. Typical p50 is 1–10ms, higher with persistence. PRM beats it on latency easily by skipping the features PRM doesn't need.
+- **For chat-shaped workloads** (channels, ACLs, presence, identities) PRM is purpose-built. Redis and RabbitMQ are generic message buses; you'd build chat semantics on top of either.
+- **For LLM-powered bots** PRM wins by a lot, regardless of broker choice. Server-side filter pushdown means an LLM-backed bot pays tokens for *responses*, not *message volume*. Redis and RabbitMQ have no equivalent — if you built bot subscriptions, debounce, cooldown, budget caps, and context-attach on top of either, you'd be reimplementing PRM's bot layer.
+
+If you just need a generic message bus for service-to-service traffic, use Redis or RabbitMQ. If you need chat with bots as first-class users and don't want to reinvent the bot integration layer, that's what PRM is for.
+
+See [DESIGN.md](DESIGN.md#comparison-to-redis-and-rabbitmq) for the dimension-by-dimension breakdown.
+
 ## What PRM is *not*
 
 - **Not IRC-compatible.** Existing IRC clients (irssi, weechat, hexchat) will not connect. PRM uses a different wire protocol; you need a PRM client.
