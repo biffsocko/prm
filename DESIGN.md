@@ -4,17 +4,21 @@ This document is the architectural source of truth. README is the elevator pitch
 
 ## Goals
 
-- **High-speed message fan-out.** Sub-millisecond p50 from `PRIVMSG` arrival on one connection to the same bytes being written to all subscribed connections on the same node. The hot path never touches disk or a database.
+- **High-speed message fan-out.** Sub-millisecond p50 from a `msg` arrival on one connection to the same bytes being written to all subscribed connections on the same node. The hot path never touches disk or a database.
+- **Multi-tenant by design.** A single PRM deployment hosts many isolated organizations / workspaces. Tenant isolation is enforced at every API boundary; no tenant can see another's data.
 - **Bots as first-class users.** Bot identities are distinct from human identities. Bots can connect like any client *or* skip the connection entirely and integrate via webhook subscriptions.
 - **LLM-token economy.** Filtering happens server-side so an LLM-backed bot only pays tokens on messages that already matched a declared trigger. See "Cost savings model" below.
+- **Production-grade resilience.** Hot-standby high availability and disaster-recovery from day one of v1. RPO measured in seconds; RTO under a minute. See "High availability and disaster recovery" below.
 - **Auth required everywhere.** No anonymous identities, no plaintext transport. TLS-only.
-- **Simple to operate.** Single binary, embedded SQLite, no external dependencies for v0.
+- **Operationally honest.** The PRM binary is single-file. The production deployment is `PRM + Postgres` — that pair, not "PRM alone." Said up front so nobody is surprised.
 
-## Non-goals (v0)
+## Non-goals (v0 / v1)
 
 - IRC wire compatibility. Existing IRC clients will not connect.
-- Federation / server-to-server. Single-node only.
-- Persistent message history. Channels live in memory; closing all clients does not lose state, but server restart does.
+- Federation / server-to-server across organizations. PRM does not yet link to other PRM (or other chat) servers.
+- Active-active multi-node within a single deployment. Tier 3 of the redundancy plan; deferred until usage justifies it.
+- Multi-region geo-replication. Tier 4; further deferred.
+- Persistent chat-message history. Channels live in memory; closing all clients does not lose state, but server restart does. (Logs / events through inbound integrations are different — they're not chat.)
 - Operator console / admin UI.
 - OAuth or SSO.
 
@@ -50,6 +54,53 @@ The `type` field is mandatory and selects the schema for the remaining fields. `
 | `error` | S→C | Generic error frame |
 
 The catalog will grow but stays small. Anything bot-related (subscription management, webhook secrets, etc.) lives on the REST control plane, not the realtime protocol.
+
+## Multi-tenancy
+
+A single PRM deployment hosts many independent organizations / workspaces. Each is a **tenant** with its own users, channels, ACLs, bots, subscriptions, and inbound integrations. Tenants cannot see each other's data under any circumstance.
+
+### Tenant model
+
+- A **tenant** has: `tenant_id` (UUID v7), human-readable `display_name`, URL-safe `slug` (used in auth and integration URLs), creation timestamp, settings (quotas, rate limits), status (`active` / `suspended`).
+- Every domain object — account, channel, ACL entry, bot, subscription, integration — belongs to exactly one tenant via `tenant_id`. UUIDs of those objects remain globally unique, but tenancy is the routing key.
+- Tenant creation is **out of band** in v0 / v1 — a platform operator runs `prmd admin create-tenant <slug>`. Self-service signup is a v2+ concern.
+- A special platform-operator scope exists for cross-tenant administration (creating tenants, setting quotas, suspending tenants). Platform operators do not appear inside tenant ACLs or channel member lists; they live in a separate `platform_admins` table.
+
+### Tenant resolution
+
+Every authenticated connection is **bound to exactly one tenant for its lifetime**. Tenant is resolved at auth time:
+
+- **Password auth:** `auth_request` carries `tenant` (slug or UUID) alongside `username`. Server scopes the credential lookup to that tenant.
+- **Token auth (bots, integrations):** the API token has the `tenant_id` baked in at issuance. Server resolves the tenant from the token; the client does not send it.
+- **Inbound integration webhooks:** the integration's token determines the tenant; the URL path `/v1/inbound/{integration_id}` is per-tenant by construction (integration_id is unique within tenant).
+
+A client that wants to switch tenants disconnects and reconnects with new credentials.
+
+### Storage shape
+
+- `tenant_id` is a column on every domain table. Composite indexes lead with `tenant_id`.
+- Default deployment: one Postgres database with row-level tenancy. For very large or strongly-isolated tenants, optional **schema-per-tenant** mode (one Postgres schema per tenant) is supported by a runtime config flag — same code, different routing.
+- In-memory state: channel registry keyed by `(tenant_id, channel_id)`; shard hash is `hash(tenant_id, channel_id)` so the broadcast path stays sharded without a global lock.
+
+### Per-tenant operational knobs
+
+Each tenant has independently-configurable limits:
+
+- Max concurrent connections
+- Max channels
+- Max bots
+- Max webhook subscriptions
+- Inbound integration rate limits
+- Outbound webhook delivery rate limits
+- Daily / monthly message ceilings (soft, for billing/usage reporting; hard, for abuse prevention)
+
+A platform operator sets defaults; per-tenant overrides land in the `tenants.settings` JSON column.
+
+### Cross-tenant isolation guarantees
+
+The implementation rule: **no domain query is written without `tenant_id` as a leading predicate.** This is enforced at the storage-package boundary — every repository function takes a `tenantID` first-class argument and there is no `getChannelByID(id)` API, only `getChannelByID(tenantID, id)`. Reviews and linters should refuse any new API that lacks this scoping.
+
+Identity model (next section) is defined *within* a tenant; account uniqueness is per-tenant, not global.
 
 ## Identity model
 
@@ -330,16 +381,91 @@ Token storage: SHA-256 hash at rest; tokens are shown to the user exactly once a
 
 ## Storage
 
-SQLite (embedded). Schemas:
+**Primary: PostgreSQL.** Production deployments target Postgres 15+. Replication for the hot-standby HA tier (below) requires streaming replication, which Postgres handles natively. Schema migrations across many tenants need real DB tooling, which Postgres has.
 
-- `accounts` (id, display_name, type, password_hash, password_salt, recovery_email, created_at, ...)
-- `tokens` (id, account_id, hash, created_at, last_used_at, revoked_at)
-- `channels` (id, name, owner_id, visibility, created_at)
-- `channel_acl` (channel_id, account_id, role, granted_at, granted_by)
-- `subscriptions` (id, account_id, channel_id, match_json, url, secret_hash, events_json, context_lines, debounce_ms, cooldown_ms, budget_json, disabled_at, ...)
-- `subscription_fires` (subscription_id, fired_at, status, attempts) — for budget accounting and debugging
+**Optional alternative: SQLite** (via `modernc.org/sqlite`). Available for small-deployment scenarios — single-tenant homelab, friend group, dev environment — where the "single binary, no dependencies" simplicity is worth giving up multi-instance HA. Same schema, same migrations, same code paths; the storage package abstracts the backend.
 
-Channel membership and presence are **not** in SQLite. They live in memory and rebuild on server restart from `channel_acl` plus reconnecting clients.
+The storage choice is configured at startup via `--storage postgres://...` or `--storage sqlite:./prm.db`. Same binary, same code, different URL.
+
+### Schemas
+
+All domain tables include `tenant_id uuid not null` as the first column, indexed.
+
+- `tenants` (id, slug, display_name, settings_json, status, created_at)
+- `accounts` (id, tenant_id, display_name, type, password_hash, password_salt, recovery_email, created_at, ...)
+- `tokens` (id, tenant_id, account_id, hash, created_at, last_used_at, revoked_at)
+- `channels` (id, tenant_id, name, owner_id, visibility, created_at)
+- `channel_acl` (tenant_id, channel_id, account_id, role, granted_at, granted_by)
+- `subscriptions` (id, tenant_id, account_id, channel_id, match_json, url, secret_hash, events_json, context_lines, debounce_ms, cooldown_ms, budget_json, disabled_at, ...)
+- `subscription_fires` (tenant_id, subscription_id, fired_at, status, attempts) — for budget accounting and debugging
+- `integrations` (id, tenant_id, channel_id, adapter, token_hash, settings_json, disabled_at, ...)
+- `platform_admins` (account_id, granted_at) — global, cross-tenant; intentionally not tenant-scoped
+
+Composite indexes lead with `tenant_id`. Queries always scope by `tenant_id` first; the storage-package API enforces this at the function signature.
+
+### What's not in durable storage
+
+Channel membership and presence **live only in memory** and rebuild on server restart from `channel_acl` (durable) plus reconnecting clients. Same shape as v0 — durable state is "who can talk to whom"; transient state is "who is currently connected." This separation is what makes hot-standby HA work cleanly: durable state replicates, transient state rebuilds.
+
+## High availability and disaster recovery
+
+PRM ships with a tiered redundancy plan. Each tier is operationally meaningful on its own; later tiers are not blocked by earlier ones being missing.
+
+### Tier 1 — Backup + restore (slice 1+)
+
+- Postgres continuously archives WAL segments to object storage (S3 / MinIO / equivalent). The PRM repo ships an example Postgres configuration; nothing PRM-specific to maintain.
+- **RPO:** seconds (WAL ship interval).
+- **RTO:** minutes (manual restore + PRM restart).
+- Single PRM node. Box dies → restore Postgres from latest base + WAL, point PRM at the restored DB, clients reconnect.
+
+### Tier 2 — Hot-standby active-passive (slice 2)
+
+- Two PRM nodes deployed. Postgres primary + streaming-replication standby.
+- Leader election via a Postgres advisory lock: `SELECT pg_try_advisory_lock(N)`. Whoever holds the lock serves traffic. Loser sits idle waiting on its own lock attempt.
+- L4 load balancer (HAProxy / nginx / cloud LB) in front of both PRM processes; health check returns 200 only from the lock-holder.
+- On primary PRM failure: lock TTL expires → standby acquires → load balancer flips → standby serves. Postgres-side: standby gets promoted via your preferred mechanism (Patroni, manual `pg_ctl promote`, etc.).
+- **RPO:** zero for committed Postgres writes (synchronous replication slot).
+- **RTO:** under 60 seconds end-to-end (lock TTL + LB health-check cycle + Postgres promotion).
+- During failover: in-memory channel state is **cold on the standby**. Clients reconnect; membership and presence rebuild from `channel_acl` + reconnecting clients. The blip is visible to users (~10–30s of disconnect), but no data is lost.
+
+### Tier 3 — Active-active multi-node (deferred, v2+)
+
+- N PRM nodes all serve traffic. Channels sharded by `hash(tenant_id, channel_id) % N`; each node "owns" a slice.
+- Cross-node messages routed via an internal pub/sub fabric (NATS Jetstream, or a small protocol between PRM nodes over TLS).
+- Presence propagated across nodes. Cross-shard joins do an internal handshake.
+- Adds 100–500 μs cross-node hop for some messages; sub-ms target preserved for same-shard messages.
+- Not in v0 / v1. **Mentioned here so v0 design choices don't preclude it** — sharding by `(tenant_id, channel_id)` already matches the would-be Tier 3 shard key.
+
+### Tier 4 — Multi-region (deferred, further)
+
+- Geo-distributed Postgres or a globally replicated DB.
+- Edge PRM nodes that route to the home region for each tenant.
+- Real-world: only matters at significant scale with latency-sensitive global users. Don't design for it now; just don't paint into a corner that forbids it (no assumptions about single-region clock sync, etc.).
+
+### Backup verification
+
+- Backups that haven't been restored are theater. The PRM repo ships a restore-test script and a documented runbook: at minimum monthly, restore the most recent base+WAL to a scratch Postgres, spin up a PRM process pointing at it, verify a known-good test tenant comes up.
+
+### Operational footprint of HA
+
+Honest framing:
+
+- **Tier 1** adds: Postgres backup configuration + object storage bucket. A few hours one-time setup.
+- **Tier 2** adds: a second PRM process, a second Postgres instance with replication, a load balancer, the lock-election sidecar logic. A day or two of standup, ongoing monitoring.
+- Tier 3+ is significantly more operational work and requires capacity planning that depends on actual usage. Don't pay this cost speculatively.
+
+### Performance impact of HA
+
+| Operation | Tier 1 (backup only) | Tier 2 (hot standby) |
+|---|---|---|
+| `msg` fan-out p50/p99 | unchanged | unchanged |
+| Connection establish + auth | +1–5 ms (Postgres vs SQLite) | same as Tier 1 |
+| JOIN (ACL lookup) | +1–5 ms | same as Tier 1 |
+| Steady-state CPU | unchanged | unchanged (standby idle) |
+| Steady-state memory | +5–10% (tenant_id everywhere) | same as Tier 1 |
+| Failover blip | N/A | 10–30s, one-time per disaster |
+
+The headline performance number (sub-ms p50 fan-out) is preserved because the hot path never touches durable storage. Multi-tenancy adds one hash dimension; HA adds zero cost during steady state. The slower operations (auth, JOIN) are off the hot path and happen rarely per connection.
 
 ## Performance design
 
@@ -399,6 +525,50 @@ PRM puts all of that in the server. The LLM-token savings documented in the "Cos
 - **Building a chat system with LLM-powered bots and you don't want to write the bot integration layer yourself.** PRM.
 
 The PRM bet is that "chat with bots as first-class users" is workload-specific enough to justify a purpose-built relay rather than building chat-plus-bot semantics on top of a generic broker.
+
+## Implementation slices
+
+Slicing the build so each step ships something useful and validates the next:
+
+**Slice 1 — Minimum viable PRM, multi-tenant from day one.**
+- TLS server + connection accept + hot fan-out path
+- `hello` / `welcome` capability negotiation (including tenant resolution)
+- Password auth handshake with tenant-scoped accounts
+- Verb subset: `hello`, `welcome`, `auth_*`, `join`, `part`, `msg`, `presence`, `ping`, `pong`
+- One public channel per tenant; no ACLs yet (channels are slice 2)
+- **PostgreSQL** as primary storage; SQLite available as alt for tiny deploys
+- In-memory channel state keyed by `(tenant_id, channel_id)`
+- Bare TUI client (`cmd/prm`)
+- Fan-out benchmark harness — proves sub-ms p50 with N synthetic clients before continuing
+- Admin CLI: `prmd admin create-tenant`
+- Tier 1 backup config (Postgres WAL archive to object storage) documented in runbook
+
+**Slice 2 — Auth surface and HA.**
+- Channel ACLs persisted in Postgres
+- Bot account type + token-method auth
+- Hot-standby HA: leader election via Postgres advisory lock + L4 LB pattern documented
+- Documented restore runbook with a restore-test script
+- Reconnect logic in TUI client (essential under HA)
+
+**Slice 3 — Webhook subscriptions + outbound delivery.**
+- REST control plane subscription CRUD
+- Subscription matcher (regex/glob/mention)
+- Debounce window, cooldown, budget caps
+- Signed HMAC HTTP POST worker pool with retry policy
+- Context-attach (last N channel messages bundled into payload)
+
+**Slice 4 — Inbound integrations.**
+- `POST /v1/inbound/{integration_id}` endpoint
+- Adapter registry; Splunk, Graylog, and generic JSON-path adapters ship as reference
+- Per-integration rate limit, optional HMAC signing
+
+**Slice 5+ — Polish and growth.**
+- Mention syntax + parsing
+- Multi-device session policy
+- Bot ghost-indicator in member lists
+- More inbound adapters (Datadog, GitHub, Jenkins, k8s Events)
+- Chat history (`chathistory` verb + durable storage of recent messages)
+- Tier 3 active-active when single-node capacity is no longer enough
 
 ## What's not designed yet
 

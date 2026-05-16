@@ -20,6 +20,18 @@ This compounds well:
 
 For a bot that previously processed 50,000 channel messages a day and only needed to respond to ~200 of them, the LLM-token reduction is roughly **two orders of magnitude** — you stop paying the model to decide "no" 49,800 times.
 
+## Built for production deployments
+
+PRM is multi-tenant from day one and has a real disaster-recovery story. The operational shape isn't an afterthought — it's part of the design.
+
+- **Multi-tenant.** A single PRM deployment hosts many organizations / workspaces, each fully isolated. Tenants cannot see each other's data under any circumstance; the implementation rule is that no domain query is written without `tenant_id` as a leading predicate. Per-tenant quotas, rate limits, and usage accounting.
+- **PostgreSQL as the primary storage.** SQLite is available for small / homelab deployments, but production targets Postgres 15+ — for replication, migrations across many tenants, and operational maturity. Storage is configurable: `--storage postgres://...` or `--storage sqlite:./prm.db`, same binary, same code.
+- **Hot-standby high availability** (slice 2 onward). Two PRM processes pointed at a Postgres primary + streaming-replication standby. Leader election via Postgres advisory lock; L4 load balancer flips on health-check failure. **RPO zero** for committed Postgres writes; **RTO under 60 seconds**.
+- **Continuous backup.** Postgres WAL archived to object storage (S3 / MinIO / equivalent) on a seconds-scale interval. RPO measured in seconds; restore runbook with a tested restore-verification script.
+- **Performance preserved under all of this.** Sub-millisecond p50 fan-out is the goal because the hot path never touches durable storage. Multi-tenancy adds one hash dimension to the channel state key; HA adds zero steady-state overhead (standby is idle until needed). The performance impact table is in [DESIGN.md](DESIGN.md#performance-impact-of-ha).
+
+The operational honesty: the PRM binary is single-file, but the production deployment is `PRM + Postgres + LB` — that triple, not "PRM alone." Said up front so nobody is surprised.
+
 ## Plugging in your existing tools
 
 PRM is not a log platform, alert engine, or event store — it's the *bot orchestration layer* that sits on top of them. To make events from Splunk, Graylog, Datadog, GitHub, CloudWatch, or anything else that can POST JSON show up as PRM events for bots to act on, point those systems at a small inbound webhook:
@@ -49,7 +61,7 @@ See [DESIGN.md](DESIGN.md#comparison-to-redis-and-rabbitmq) for the dimension-by
 ## What PRM is *not*
 
 - **Not IRC-compatible.** Existing IRC clients (irssi, weechat, hexchat) will not connect. PRM uses a different wire protocol; you need a PRM client.
-- **Not federated.** Single server topology in v0. No server-to-server linking.
+- **Not federated.** Single deployment topology. No server-to-server linking between PRM instances or to other chat networks. Hot-standby HA within a single deployment is supported; multi-region geo-replication is not.
 - **Not anonymous.** Every connection authenticates. No anonymous join under any setting; the `public` channel visibility just means "any authenticated account may join."
 - **Not a message archive (yet).** v0 does not persist chat history. Messages exist in memory for the lifetime of an active channel. Chat history persistence and the `chathistory`-equivalent retrieval API are deferred to v1.
 

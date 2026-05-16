@@ -16,12 +16,15 @@ Before writing implementation code, confirm the scope decisions in DESIGN.md "Op
 
 ## Hard constraints — don't break without asking
 
-- **Two binaries, one Go module.** `cmd/prmd` (server) and `cmd/prm` (TUI reference client). Both ship from the same module. No microservices in v0.
-- **Single binary deploys.** `prmd` brings its own SQLite (CGO-less driver, e.g. `modernc.org/sqlite`) and listens on two TLS ports: realtime + REST control plane. No external dependencies needed to operate v0.
+- **Two binaries, one Go module.** `cmd/prmd` (server) and `cmd/prm` (TUI reference client). Both ship from the same module. No microservices.
+- **Single PRM binary** — but the **production deployment is `PRM + Postgres + L4 load balancer`**, not "PRM alone." Stated up front in README so nobody is surprised. Don't slip back toward "zero external dependencies" — that was the pre-multi-tenant goal, walked back deliberately to enable multi-tenancy and HA.
+- **Multi-tenant from day one.** `tenant_id` is the first dimension of every domain operation. **No storage-package function exists that lacks `tenantID` as a leading argument.** Reviewers and linters should refuse any new repository function without it. This is the single most important architectural rule — get it wrong once and you have a cross-tenant data leak.
+- **PostgreSQL is the primary storage backend.** Use `github.com/jackc/pgx/v5` (no ORM). SQLite via `modernc.org/sqlite` is supported as an alternate backend for tiny / single-tenant deploys — both implement the same `storage` interface so server code is backend-agnostic. Configured at startup via `--storage postgres://...` or `--storage sqlite:./prm.db`.
 - **TLS only on the wire.** No plaintext fallback, no `--allow-plaintext` flag. Localhost too.
-- **No anonymous identities.** Every connection authenticates. `public` channel visibility means "any authenticated account may join," not "no auth required."
+- **No anonymous identities.** Every connection authenticates. `public` channel visibility means "any authenticated account in this tenant may join," not "no auth required."
 - **Webhook delivery never blocks realtime fan-out.** The hot message path completes before any HTTP outbound is issued. Webhook firing is on a parallel worker pool.
 - **JSON line framing, not binary.** Easy to debug with `nc` / `websocat`, easy to extend. Performance comes from the fan-out path (precomputed serialized frames, `Writev` on the outbound side), not from a clever binary encoding.
+- **HA via Postgres advisory-lock leader election.** Slice 2 onward, two PRM processes run; whoever holds the lock serves traffic, the loser sits idle. Don't reach for Raft / etcd / Consul / Patroni-as-a-library — the advisory lock pattern is enough and stays inside Postgres.
 
 ## Layout (when code lands)
 
@@ -42,7 +45,10 @@ prm/
     server/                # core server: connection accept, hot fan-out, channel state
     auth/                  # Argon2id password hashing, token issuance/verification, SASL flow
     channels/              # in-memory channel state, sharded locks, member list ops
-    storage/               # SQLite schema, account/channel/ACL/subscription persistence
+    storage/               # storage interface + Postgres (primary) and SQLite (alt) implementations
+                           # every function takes tenantID as a leading arg
+    ha/                    # leader election via Postgres advisory lock; standby lifecycle
+    tenants/               # tenant model, quotas, settings, platform-admin operations
     rest/                  # HTTP control plane (account/channel/subscription/integration CRUD)
     webhook/               # subscription matcher, debounce buffer, signed HTTP POST worker pool
     inbound/               # inbound integration receiver: POST /v1/inbound/{id} handler + adapter registry
@@ -58,7 +64,7 @@ This is the target. Initial code should land within this layout; resist refactor
 
 - **Go style.** Standard `gofmt`, `golangci-lint` clean. Errors propagated, not logged-and-swallowed. `context.Context` first arg on anything that can block.
 - **Frame types are structs with `json:"..."` tags**, generated/maintained by hand from the verb catalog in DESIGN.md. No protobuf, no codegen tools.
-- **No third-party Go dependencies beyond:** `modernc.org/sqlite`, `golang.org/x/crypto/argon2`, `nhooyr.io/websocket` (or `gorilla/websocket`), `github.com/charmbracelet/bubbletea` (TUI client). If you reach for anything else, ask first.
+- **No third-party Go dependencies beyond:** `github.com/jackc/pgx/v5` (Postgres), `modernc.org/sqlite` (alt storage), `golang.org/x/crypto/argon2`, `nhooyr.io/websocket` (or `gorilla/websocket`), `github.com/charmbracelet/bubbletea` (TUI client), `github.com/google/uuid` (UUID v7). If you reach for anything else, ask first.
 - **No `init()` functions** doing real work. Boot order is explicit in `main`.
 - **No global state.** Server struct owns everything; tests construct it.
 - **Tests live next to the code** (`foo_test.go`) for unit tests; cross-package integration tests live under `test/e2e/`.
@@ -78,7 +84,9 @@ If you're tempted to change anything in this list, that's the conversation, not 
 
 ## Common pitfalls
 
-- **Don't block fan-out on storage.** Channel ACLs are checked at JOIN time and cached in the in-memory channel state. Message delivery never touches SQLite.
+- **Don't block fan-out on storage.** Channel ACLs are checked at JOIN time and cached in the in-memory channel state. Message delivery never touches Postgres (or SQLite). The hot path is in-memory only — that's why HA's perf overhead is zero.
+- **Never write a domain query without `tenant_id` scope.** Every storage function takes `tenantID` as a leading argument. There is no `getChannelByID(id)` — only `getChannelByID(tenantID, id)`. A missing tenant scope is a cross-tenant data leak. Treat it like a security bug, not a style issue.
+- **Don't try to make the standby PRM warm.** Tier 2 HA accepts a 10–30s reconnect blip on failover. Warming the standby's in-memory state would require streaming presence/membership cross-node, which is essentially the Tier 3 active-active problem in disguise. Stay cold; clients reconnect; presence rebuilds.
 - **Don't put webhook delivery inline.** Even a 5ms HTTP roundtrip ruins fan-out latency if it's in the hot path. Worker pool, always.
 - **Inbound integration adapters are stateless.** A `Normalize(body, headers) → Event` function. No DB lookups, no outbound calls. If a source needs enrichment, do it in the bot that subscribes, not in the adapter.
 - **Don't turn PRM into a log platform.** Inbound integrations exist so PRM can *consume* events from Splunk / Graylog / Datadog / etc., not so PRM can replace them. If you find yourself adding storage, indexes, or a query language for ingested events, stop — that's a different product.
