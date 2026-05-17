@@ -172,10 +172,18 @@ func (f *fixture) runRound(tb testing.TB) []time.Duration {
 	if err := f.sender.send(proto.Msg{Channel: benchChannel, Body: "x"}); err != nil {
 		tb.Fatal(err)
 	}
-	// Sender will also receive its own broadcast; drain it so the next round is clean.
-	go func() {
-		f.sender.dec.Decode()
-	}()
+	// Drain the sender's own echo SYNCHRONOUSLY. A fire-and-forget goroutine
+	// here would race with itself across rounds (multiple goroutines reading
+	// the same Scanner). One drain per round, in-line.
+	for {
+		sf, err := f.sender.dec.Decode()
+		if err != nil {
+			tb.Fatalf("sender echo drain: %v", err)
+		}
+		if _, ok := sf.(proto.Msg); ok {
+			break
+		}
+	}
 
 	wg.Wait()
 	return latencies
