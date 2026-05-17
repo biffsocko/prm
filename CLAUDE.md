@@ -10,9 +10,15 @@ The standout design choice: **server-side filter pushdown for bot subscriptions.
 
 ## Project state
 
-**Design phase.** As of the last edit there is no Go code, no `go.mod`, no implementation — only documentation. README is the elevator pitch; DESIGN.md is the architectural contract; this file is the working notes.
+**Slice 1 complete.** A working TLS PRM server (`prmd`) and reference TUI client (`prm`) with multi-tenant SQLite storage, password auth, one public channel per tenant, broadcast fan-out, and end-to-end tests + a fan-out latency benchmark. Postgres backend is a stub awaiting a real Postgres to test against. Slices 2–5 (ACLs, bot tokens, HA, webhooks, inbound integrations) are still ahead — see [DESIGN.md](DESIGN.md#implementation-slices).
 
-Before writing implementation code, confirm the scope decisions in DESIGN.md "Open questions" with the project owner.
+Headline numbers from `go test -run TestFanoutLatency -v ./test/bench/` on Apple Silicon:
+
+- n=10  → p50=241µs, p99=761µs
+- n=50  → p50=291µs, p99=734µs
+- n=100 → p50=570µs, p99=1.89ms
+
+Sub-ms p50 fan-out target met. README documents the reproduction steps.
 
 ## Hard constraints — don't break without asking
 

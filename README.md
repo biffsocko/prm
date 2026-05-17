@@ -2,7 +2,36 @@
 
 A high-speed, auth-required chat relay built for LLM-powered bots as first-class citizens. Similar shape to IRC — server, channels, identities, private messages — but a fresh wire protocol and modern primitives throughout.
 
-**Status:** design phase. No implementation yet. See [DESIGN.md](DESIGN.md) for the architecture.
+**Status:** slice 1 implemented. Real TLS server, password auth, multi-tenant from day one, channel join + broadcast fan-out, TUI client. Sub-ms p50 fan-out hit on the included benchmark. See [DESIGN.md](DESIGN.md#implementation-slices) for the full slice plan and what's deferred to slices 2–5.
+
+## Try it locally
+
+```bash
+git clone https://github.com/biffsocko/prm && cd prm
+go build ./...
+
+# initialize storage + a tenant + an account
+./prmd admin create-tenant --storage sqlite:./prm.db --display-name "Acme Corp" acme
+./prmd admin create-account --storage sqlite:./prm.db --password hunter2 acme alex
+./prmd admin generate-cert --out-dir ./certs localhost
+
+# start the server (dev mode = self-signed cert for localhost)
+./prmd serve --dev --storage sqlite:./prm.db &
+
+# connect with the TUI client (--insecure for the dev cert)
+PRM_PASSWORD=hunter2 ./prm --insecure localhost:6697 acme alex general
+```
+
+## Benchmark numbers (slice 1, single laptop, Apple Silicon)
+
+| Members | p50 | p95 | p99 | max |
+|--------:|----:|----:|----:|----:|
+| 10 | 241 µs | 527 µs | 761 µs | 827 µs |
+| 50 | 291 µs | 440 µs | 734 µs | 875 µs |
+| 100 | 570 µs | 843 µs | 1.89 ms | 2.45 ms |
+
+Sub-ms p50 fan-out holds at every tested size. Reproduce with `go test -run TestFanoutLatency -v ./test/bench/`.
+
 
 ## Why PRM exists
 
