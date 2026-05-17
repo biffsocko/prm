@@ -49,6 +49,24 @@ This compounds well:
 
 For a bot that previously processed 50,000 channel messages a day and only needed to respond to ~200 of them, the LLM-token reduction is roughly **two orders of magnitude** — you stop paying the model to decide "no" 49,800 times.
 
+```mermaid
+sequenceDiagram
+    participant Users
+    participant S as prmd
+    participant Sub as Subscription matcher
+    participant Bot as LLM bot<br/>(serverless function)
+
+    Users->>S: ~50,000 msgs/day in #ops
+    loop every inbound msg
+        S->>Sub: any subscription match?
+    end
+    Note over Sub: regex / glob / mention<br/>filter — ~200/day match
+    Sub->>Bot: HTTP POST<br/>(signed, debounced, with N msgs context)
+    Note over Bot: LLM sees only<br/>pre-qualified messages<br/>≈ 100× token savings vs<br/>always-on filter-in-bot
+    Bot->>S: post triage response back into channel
+```
+
+
 ## Built for production deployments
 
 PRM is multi-tenant from day one and has a real disaster-recovery story. The operational shape isn't an afterthought — it's part of the design.
@@ -60,6 +78,121 @@ PRM is multi-tenant from day one and has a real disaster-recovery story. The ope
 - **Performance preserved under all of this.** Sub-millisecond p50 fan-out is the goal because the hot path never touches durable storage. Multi-tenancy adds one hash dimension to the channel state key; HA adds zero steady-state overhead (standby is idle until needed). The performance impact table is in [DESIGN.md](DESIGN.md#performance-impact-of-ha).
 
 The operational honesty: the PRM binary is single-file, but the production deployment is `PRM + Postgres + LB` — that triple, not "PRM alone." Said up front so nobody is surprised.
+
+```mermaid
+flowchart TB
+    Clients[Clients<br/>tenants: acme, globex, initech]
+    LB[L4 Load Balancer<br/>health check probes which prmd<br/>holds the Postgres advisory lock]
+
+    subgraph prmd_pair[prmd processes — same binary]
+        Active[prmd ACTIVE<br/>holds advisory lock<br/>serves all traffic]
+        Standby[prmd STANDBY<br/>idle, waiting on lock]
+    end
+
+    subgraph pg[PostgreSQL]
+        PGP[(Primary<br/>tenants / accounts / channel_acl /<br/>subscriptions — every row has tenant_id)]
+        PGS[(Standby<br/>streaming replication)]
+    end
+
+    S3[(Object storage<br/>WAL archive)]
+
+    Clients --> LB
+    LB --> Active
+    LB -. failover only .-> Standby
+    Active --> PGP
+    Standby -. on promotion .-> PGP
+    PGP ==>|sync replication| PGS
+    PGP -->|continuous WAL ship| S3
+```
+
+Tenant isolation is enforced at the type system: every storage function takes `tenantID` as its leading argument, so a query that forgets to scope by tenant won't compile. On failover the standby PRM takes the Postgres advisory lock, the load balancer flips, and clients reconnect — in-memory channel state rebuilds from the durable ACL data plus reconnecting members. RPO is zero (synchronous replication); RTO is under 60s.
+
+## How it works
+
+### System overview
+
+```mermaid
+flowchart LR
+    subgraph clients[Clients]
+        H[Human clients<br/>TUI / web]
+        BC[Bots<br/>persistent conn]
+        BW[Bots<br/>webhook only]
+    end
+    subgraph server[prmd — single binary]
+        TLS[TLS listener :6697<br/>JSON-line framing]
+        REST[REST control plane :8443<br/>tenants / channels / subs]
+        Reg[Channel registry<br/>in-memory, sharded]
+        WH[Webhook worker pool<br/>signed HMAC POSTs]
+        IN[Inbound integration handler<br/>/v1/inbound/&#123;id&#125;]
+        ST[Storage interface]
+    end
+    PG[(PostgreSQL<br/>primary)]
+    SQ[(SQLite<br/>alt for small deploys)]
+    subgraph external[External event sources]
+        Splunk
+        Graylog
+        GH[GitHub<br/>etc.]
+    end
+
+    H -->|TLS| TLS
+    BC -->|TLS| TLS
+    TLS <--> Reg
+    Reg --> WH
+    WH -->|POST| BW
+    REST --> ST
+    Reg -.->|JOIN: ACL lookup| ST
+    ST --> PG
+    ST -. or .-> SQ
+    Splunk -->|webhook| IN
+    Graylog -->|webhook| IN
+    GH -->|webhook| IN
+    IN --> Reg
+```
+
+The PRM binary is one process with two TLS listeners: realtime (where chat clients and persistent bots connect) and REST (control plane for account / channel / subscription / integration management). Channel state is in-memory and sharded; the message-fan-out path never touches storage. External event sources POST into the inbound handler, which republishes events as channel messages — picked up by the same bot subscription machinery as native chat.
+
+### Connect + authenticate
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as prmd
+
+    C->>S: TLS handshake
+    C->>S: hello {cap_version, capabilities}
+    S->>C: welcome {server_name, cap_version, negotiated capabilities}
+    C->>S: auth_request {method:"password", tenant, username}
+    Note over S: lookup tenant + account<br/>generate server nonce
+    S->>C: auth_challenge {salt, nonce, argon2 params}
+    Note over C: Argon2id(password, salt, params)
+    C->>S: auth_response {proof}
+    Note over S: constant-time compare<br/>against stored hash
+    S->>C: auth_ok {account_id, tenant_id, display_name}
+```
+
+Three frames after the TLS handshake. The challenge carries the account's stored Argon2id parameters so tuning the cost factor doesn't invalidate existing hashes. The connection is bound to one tenant for its lifetime — to switch tenants, reconnect.
+
+### Channel message fan-out (the hot path)
+
+```mermaid
+sequenceDiagram
+    participant A as Alex
+    participant S as prmd
+    participant B as Bob
+    participant C as Carol
+
+    A->>S: msg #general "hello"
+    Note over S: 1. look up channel by<br/>(tenant_id, channel_id)<br/>in sharded registry
+    Note over S: 2. encode wire bytes ONCE<br/>(precomputed broadcast frame)
+    par fan-out under shard RLock
+        S->>A: msg (echo)
+        S->>B: msg
+        S->>C: msg
+    end
+    Note over A,C: same []byte enqueued to each member's<br/>outbound queue — p50 sub-ms on a single node
+```
+
+The hot path is in-memory only. ACLs are checked at JOIN time and cached in the channel's member list; broadcasting never touches Postgres. The wire bytes are computed once per inbound message and the same `[]byte` is pushed onto every member's per-connection outbound queue, so fan-out scales linearly without lock contention across channels (the registry is sharded into 64 shards by `hash(tenant_id, channel_id)`).
 
 ## Plugging in your existing tools
 
@@ -73,6 +206,24 @@ Authorization: Bearer <integration-token>
 Per-source adapters (Splunk and Graylog ship as reference; a generic JSON-path adapter handles the long tail) normalize the payload, republish it as a PRM channel event, and the existing webhook subscription machinery — including the cost savings story above — drives whatever bots care to react. One mental model for chat messages, log alerts, GitHub PRs, deploy notifications.
 
 See [DESIGN.md](DESIGN.md#inbound-integrations) for the adapter contract and the Splunk / Graylog field mappings.
+
+```mermaid
+sequenceDiagram
+    participant Splunk
+    participant IN as prmd<br/>/v1/inbound/&#123;id&#125;
+    participant Reg as Channel registry
+    participant Sub as Subscription matcher
+    participant Bot as LLM triage bot
+
+    Splunk->>IN: POST {search_name, result} <br/>Authorization: Bearer ...
+    Note over IN: per-source adapter normalizes:<br/>event{source, service, severity,<br/>summary, fields, occurred_at}
+    IN->>Reg: republish as channel event
+    Reg->>Sub: subscription match?
+    Note over Sub: filter pre-qualifies<br/>(e.g., severity ≥ error)
+    Sub->>Bot: signed POST<br/>(with N msgs of channel context)
+    Bot->>Reg: post triage summary back to channel
+```
+
 
 ## How does PRM compare to Redis or RabbitMQ?
 
