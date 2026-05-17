@@ -54,3 +54,36 @@ func (*Store) GetAccountByID(context.Context, uuid.UUID, uuid.UUID) (*storage.Ac
 func (*Store) GetAccountByUsername(context.Context, uuid.UUID, string) (*storage.Account, error) {
 	return nil, ErrNotImplemented
 }
+func (*Store) CreateChannel(context.Context, uuid.UUID, *storage.Channel) error { return ErrNotImplemented }
+func (*Store) GetChannelByID(context.Context, uuid.UUID, uuid.UUID) (*storage.Channel, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) GetChannelByName(context.Context, uuid.UUID, string) (*storage.Channel, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) ListChannels(context.Context, uuid.UUID) ([]*storage.Channel, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) SetChannelACL(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, storage.ChannelRole, uuid.UUID) error {
+	return ErrNotImplemented
+}
+func (*Store) GetChannelACL(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (*storage.ChannelACLEntry, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) ListChannelACL(context.Context, uuid.UUID, uuid.UUID) ([]*storage.ChannelACLEntry, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) RemoveChannelACL(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error {
+	return ErrNotImplemented
+}
+func (*Store) CreateToken(context.Context, uuid.UUID, uuid.UUID, []byte, string) (*storage.Token, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) GetTokenByHash(context.Context, []byte) (*storage.Token, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) ListTokens(context.Context, uuid.UUID, uuid.UUID) ([]*storage.Token, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) RevokeToken(context.Context, uuid.UUID, uuid.UUID) error { return ErrNotImplemented }
+func (*Store) TouchTokenLastUsed(context.Context, uuid.UUID) error      { return ErrNotImplemented }

@@ -69,6 +69,67 @@ type Account struct {
 	CreatedAt      time.Time
 }
 
+// ChannelVisibility controls who can join.
+type ChannelVisibility string
+
+const (
+	// ChannelPrivate requires an explicit ACL entry to JOIN.
+	ChannelPrivate ChannelVisibility = "private"
+	// ChannelPublic lets any authenticated account in the tenant JOIN.
+	ChannelPublic ChannelVisibility = "public"
+)
+
+// Channel is a persisted chat channel within a tenant. Channel.Name is
+// human-readable and unique per tenant. Channel.ID is opaque and stable.
+type Channel struct {
+	ID         uuid.UUID
+	TenantID   uuid.UUID
+	Name       string
+	OwnerID    uuid.UUID
+	Visibility ChannelVisibility
+	CreatedAt  time.Time
+}
+
+// ChannelRole controls what an account can do in a channel.
+type ChannelRole string
+
+const (
+	RoleOwner  ChannelRole = "owner"
+	RoleAdmin  ChannelRole = "admin"
+	RoleMember ChannelRole = "member"
+	RoleBanned ChannelRole = "banned"
+)
+
+// CanJoin reports whether the role permits joining the channel.
+func (r ChannelRole) CanJoin() bool {
+	return r == RoleOwner || r == RoleAdmin || r == RoleMember
+}
+
+// ChannelACLEntry is one row of a channel's access control list.
+type ChannelACLEntry struct {
+	TenantID  uuid.UUID
+	ChannelID uuid.UUID
+	AccountID uuid.UUID
+	Role      ChannelRole
+	GrantedAt time.Time
+	GrantedBy uuid.UUID // account who issued the grant; zero for owner self-grant on create
+}
+
+// Token is an API token issued to a bot account. The plaintext token is
+// shown to the user exactly once at issuance; only the SHA-256 hash is
+// stored. Lookup is by hash (the server hashes the bearer token on auth
+// and looks it up).
+type Token struct {
+	ID         uuid.UUID
+	TenantID   uuid.UUID
+	AccountID  uuid.UUID
+	Hash       []byte    // SHA-256 of the plaintext token
+	Label      string    // optional, human-readable
+	CreatedAt  time.Time
+	LastUsedAt time.Time // updated opportunistically; not transactional
+	RevokedAt  time.Time // zero = active
+}
+
 // Store is the durable-state interface. Implementations live in
 // storage/sqlite and storage/postgres.
 //
@@ -91,4 +152,23 @@ type Store interface {
 	CreateAccount(ctx context.Context, tenantID uuid.UUID, a *Account) error
 	GetAccountByID(ctx context.Context, tenantID, id uuid.UUID) (*Account, error)
 	GetAccountByUsername(ctx context.Context, tenantID uuid.UUID, username string) (*Account, error)
+
+	// Channels
+	CreateChannel(ctx context.Context, tenantID uuid.UUID, c *Channel) error
+	GetChannelByID(ctx context.Context, tenantID, id uuid.UUID) (*Channel, error)
+	GetChannelByName(ctx context.Context, tenantID uuid.UUID, name string) (*Channel, error)
+	ListChannels(ctx context.Context, tenantID uuid.UUID) ([]*Channel, error)
+
+	// Channel ACLs
+	SetChannelACL(ctx context.Context, tenantID, channelID, accountID uuid.UUID, role ChannelRole, grantedBy uuid.UUID) error
+	GetChannelACL(ctx context.Context, tenantID, channelID, accountID uuid.UUID) (*ChannelACLEntry, error)
+	ListChannelACL(ctx context.Context, tenantID, channelID uuid.UUID) ([]*ChannelACLEntry, error)
+	RemoveChannelACL(ctx context.Context, tenantID, channelID, accountID uuid.UUID) error
+
+	// Tokens (bot API tokens)
+	CreateToken(ctx context.Context, tenantID, accountID uuid.UUID, hash []byte, label string) (*Token, error)
+	GetTokenByHash(ctx context.Context, hash []byte) (*Token, error)
+	ListTokens(ctx context.Context, tenantID, accountID uuid.UUID) ([]*Token, error)
+	RevokeToken(ctx context.Context, tenantID, tokenID uuid.UUID) error
+	TouchTokenLastUsed(ctx context.Context, tokenID uuid.UUID) error
 }
