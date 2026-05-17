@@ -125,8 +125,17 @@ func (c *Conn) serve(ctx context.Context) {
 	go func() { defer wg.Done(); c.writeLoop(ctx) }()
 	go func() { defer wg.Done(); c.pingLoop(ctx) }()
 
-	// Read loop runs on the goroutine that called serve; closing it triggers
-	// the others via ctx cancellation in our deferred close().
+	// Close the underlying conn when ctx cancels. Without this, the read
+	// loop's blocking Decode() never wakes up on shutdown and serve()
+	// deadlocks. The close itself is idempotent via closeOnce.
+	go func() {
+		<-ctx.Done()
+		c.closed.Store(true)
+		_ = c.raw.Close()
+	}()
+
+	// Read loop runs on the goroutine that called serve; when it returns,
+	// we cancel the ctx and wait for the write/ping goroutines.
 	c.readLoop(ctx)
 	cancel()
 	wg.Wait()
