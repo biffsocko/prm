@@ -57,6 +57,9 @@ func setup(tb testing.TB, numClients int) *fixture {
 	if err := st.CreateTenant(context.Background(), ten); err != nil {
 		tb.Fatal(err)
 	}
+	// Slice 2: channels are explicit. Bench needs a public #general.
+	// Owner is the shared bench account (created next), but we don't have its
+	// ID yet, so we'll create the channel after the account.
 	// Single shared bench account: all clients log in as the same account
 	// (PRM allows N concurrent connections per account). This avoids the
 	// O(N) Argon2id setup cost so the benchmark measures the fan-out path,
@@ -68,6 +71,11 @@ func setup(tb testing.TB, numClients int) *fixture {
 		PasswordHash:   hash, PasswordSalt: salt, PasswordParams: params,
 	}
 	if err := st.CreateAccount(context.Background(), ten.ID, acc); err != nil {
+		tb.Fatal(err)
+	}
+	if err := st.CreateChannel(context.Background(), ten.ID, &storage.Channel{
+		Name: benchChannel, OwnerID: acc.ID, Visibility: storage.ChannelPublic,
+	}); err != nil {
 		tb.Fatal(err)
 	}
 	// Pre-compute the client-side Argon2id proof once and reuse it for every

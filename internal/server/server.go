@@ -14,10 +14,8 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -149,23 +147,31 @@ func (s *Server) completePasswordAuth(ctx context.Context, ch *auth.Challenge, p
 	return auth.CompletePasswordAuth(ctx, s.store, ch, proofB64)
 }
 
-// channelIDForName maps (tenantID, channelName) to a deterministic UUID.
-// Slice 1 derives channel IDs from name so JOIN("general") always lands on
-// the same channel state across reconnects. Slice 2 will introduce real
-// persisted channels with explicit IDs and ACLs.
-func (s *Server) channelIDForName(tenantID uuid.UUID, name string) uuid.UUID {
-	h := sha256.New()
-	h.Write(tenantID[:])
-	h.Write([]byte("/"))
-	h.Write([]byte(name))
-	sum := h.Sum(nil)
-	var id uuid.UUID
-	copy(id[:], sum[:16])
-	// Stamp version 5 (name-based) in the version nibble.
-	id[6] = (id[6] & 0x0F) | 0x50
-	// Stamp variant.
-	id[8] = (id[8] & 0x3F) | 0x80
-	return id
+// canJoin enforces channel ACLs on JOIN.
+//
+//	- ChannelPublic: any authenticated account in the tenant may join.
+//	- ChannelPrivate: account must have an ACL entry with a role that
+//	  satisfies ChannelRole.CanJoin() (owner / admin / member).
+//
+// Returns (allowed, wireReasonCode). wireReasonCode is one of
+// "permission_denied" (in ACL but role doesn't allow it, e.g. banned)
+// or "not_in_acl" (no ACL entry at all on a private channel).
+func (s *Server) canJoin(ctx context.Context, tenantID uuid.UUID, channel *storage.Channel, accountID uuid.UUID) (bool, string) {
+	switch channel.Visibility {
+	case storage.ChannelPublic:
+		return true, ""
+	case storage.ChannelPrivate:
+		entry, err := s.store.GetChannelACL(ctx, tenantID, channel.ID, accountID)
+		if err != nil {
+			return false, "not_in_acl"
+		}
+		if !entry.Role.CanJoin() {
+			return false, "permission_denied"
+		}
+		return true, ""
+	default:
+		return false, "unknown_visibility"
+	}
 }
 
 // authErrorReason maps auth-layer errors to wire-safe reason codes.
@@ -188,6 +194,7 @@ func authErrorReason(err error) string {
 // consistently as base64.
 func base64encode(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 
-// quiet the unused-import lints for binary; reserved for future use in
-// length-prefixed extensions of the wire protocol.
-var _ = binary.LittleEndian
+// uuidUnused suppresses unused-import warnings if uuid only appears in
+// signatures of helpers further down. It's currently referenced; this is
+// belt-and-suspenders against future refactors.
+var _ = uuid.Nil

@@ -58,6 +58,12 @@ func newFixture(t *testing.T) *e2eFixture {
 	if err := s.CreateAccount(context.Background(), ten.ID, acc); err != nil {
 		t.Fatal(err)
 	}
+	// Slice 2: channels are explicit. Create a public #general for the tests.
+	if err := s.CreateChannel(context.Background(), ten.ID, &storage.Channel{
+		Name: "general", OwnerID: acc.ID, Visibility: storage.ChannelPublic,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Listen on a random port so tests can run in parallel.
 	addr := pickFreeAddr(t)
@@ -150,9 +156,12 @@ func (c *client) send(t *testing.T, f proto.Frame) {
 
 // recvType reads frames until one of the wanted types is seen, returning it.
 // Discards anything else (such as Ping frames the server may send).
+//
+// Deadline is generous (10s) because Argon2id during auth takes ~5s under
+// the race detector; this needs to cover the slow path comfortably.
 func (c *client) recvType(t *testing.T, want ...string) proto.Frame {
 	t.Helper()
-	_ = c.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = c.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	defer c.conn.SetReadDeadline(time.Time{})
 	for {
 		f, err := c.dec.Decode()
@@ -264,7 +273,7 @@ func TestServerCrossTenantIsolation(t *testing.T) {
 	// Two clients in different tenants should not see each other's broadcasts
 	// even if both join a channel called "general".
 	f := newFixture(t)
-	// Add a second tenant + account
+	// Add a second tenant + account + public #general channel.
 	ctx := context.Background()
 	t2 := &storage.Tenant{Slug: "globex", DisplayName: "Globex"}
 	if err := f.store.CreateTenant(ctx, t2); err != nil {
@@ -273,6 +282,11 @@ func TestServerCrossTenantIsolation(t *testing.T) {
 	hash, salt, params, _ := auth.HashPassword("p2")
 	a2 := &storage.Account{Username: "bob", DisplayName: "Bob", PasswordHash: hash, PasswordSalt: salt, PasswordParams: params}
 	if err := f.store.CreateAccount(ctx, t2.ID, a2); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.CreateChannel(ctx, t2.ID, &storage.Channel{
+		Name: "general", OwnerID: a2.ID, Visibility: storage.ChannelPublic,
+	}); err != nil {
 		t.Fatal(err)
 	}
 

@@ -26,11 +26,20 @@ type Store struct {
 // Open opens (or creates) a SQLite database at the given DSN.
 // The DSN is the path (or file:... URL) accepted by modernc.org/sqlite.
 // The caller should call Migrate(ctx) before using the store.
+//
+// Connection-pool size is pinned to 1. SQLite serializes writes anyway,
+// and for in-memory databases (":memory:") database/sql will otherwise
+// give each pooled connection its own private database -- the first
+// connection sees the schema, others see nothing. One connection is also
+// simpler to reason about under WAL mode for our scale; if you need
+// higher concurrency, use the postgres backend.
 func Open(dsn string) (*Store, error) {
 	db, err := sql.Open("sqlite", dsn+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(on)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("sqlite open: %w", err)
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite ping: %w", err)

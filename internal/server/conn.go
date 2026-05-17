@@ -71,6 +71,12 @@ type Conn struct {
 	// Accessed only from the read goroutine.
 	pendingChal *auth.Challenge
 
+	// joinedChannels caches (channel_name -> channel_id) for channels this
+	// connection has successfully joined. Looked up by handleMsg and
+	// handlePart so the hot path doesn't touch storage. Accessed only from
+	// the read goroutine (single-threaded per conn), so no lock needed.
+	joinedChannels map[string]uuid.UUID
+
 	log *slog.Logger
 }
 
@@ -78,14 +84,15 @@ type Conn struct {
 func newConn(srv *Server, raw net.Conn) *Conn {
 	id := uuid.Must(uuid.NewV7())
 	return &Conn{
-		srv:    srv,
-		raw:    raw,
-		dec:    proto.NewDecoder(raw),
-		w:      bufio.NewWriterSize(raw, 8*1024),
-		id:     id,
-		out:    make(chan []byte, outboundQueueSize),
-		pongCh: make(chan string, 4),
-		log:    srv.log.With("conn", id.String()[:8]),
+		srv:            srv,
+		raw:            raw,
+		dec:            proto.NewDecoder(raw),
+		w:              bufio.NewWriterSize(raw, 8*1024),
+		id:             id,
+		out:            make(chan []byte, outboundQueueSize),
+		pongCh:         make(chan string, 4),
+		joinedChannels: make(map[string]uuid.UUID, 4),
+		log:            srv.log.With("conn", id.String()[:8]),
 	}
 }
 
@@ -382,12 +389,25 @@ func (c *Conn) handleJoin(ctx context.Context, j proto.Join) {
 		c.sendError("invalid_request", "channel is required", j.ID)
 		return
 	}
-	// Slice 1: one public channel per tenant, derived deterministically from
-	// (tenant, name). UUID v5 with the tenant as namespace would be ideal;
-	// for slice 1 we use a fixed-namespace v5 over the tenant slug + channel
-	// name. The channel's existence is implicit -- first JOIN creates it.
-	chanID := c.srv.channelIDForName(c.tenantID, j.Channel)
-	ch := c.srv.channels.GetOrCreate(c.tenantID, chanID, j.Channel)
+	// Look up the persisted channel by (tenant, name). Channels must be
+	// explicitly created (no implicit creation on first JOIN) -- that's a
+	// slice 2 change from slice 1's name-derived deterministic UUIDs.
+	channel, err := c.srv.store.GetChannelByName(ctx, c.tenantID, j.Channel)
+	if err != nil {
+		c.sendError("channel_not_found", "no such channel in this tenant", j.ID)
+		return
+	}
+	// ACL enforcement.
+	allowed, reason := c.srv.canJoin(ctx, c.tenantID, channel, c.accountID)
+	if !allowed {
+		c.sendError(reason, "not permitted to join this channel", j.ID)
+		return
+	}
+	// Cache the channel id on the connection for fast lookup in
+	// handlePart / handleMsg.
+	c.joinedChannels[j.Channel] = channel.ID
+
+	ch := c.srv.channels.GetOrCreate(c.tenantID, channel.ID, j.Channel)
 	added := ch.AddMember(c)
 	if added {
 		presence, _ := proto.EncodeBytes(proto.Presence{
@@ -405,7 +425,12 @@ func (c *Conn) handlePart(ctx context.Context, p proto.Part) {
 		c.sendError("invalid_request", "channel is required", p.ID)
 		return
 	}
-	chanID := c.srv.channelIDForName(c.tenantID, p.Channel)
+	chanID, ok := c.joinedChannels[p.Channel]
+	if !ok {
+		// Not joined; nothing to do.
+		return
+	}
+	delete(c.joinedChannels, p.Channel)
 	ch := c.srv.channels.Get(c.tenantID, chanID)
 	if ch == nil {
 		return
@@ -424,16 +449,23 @@ func (c *Conn) handlePart(ctx context.Context, p proto.Part) {
 
 func (c *Conn) handleMsg(ctx context.Context, m proto.Msg) {
 	if m.Channel == "" {
-		c.sendError("invalid_request", "channel is required for slice 1 msgs", m.ID)
+		c.sendError("invalid_request", "channel is required", m.ID)
 		return
 	}
 	if m.Body == "" {
 		return
 	}
-	chanID := c.srv.channelIDForName(c.tenantID, m.Channel)
+	// Hot path: look up channel by name in the per-connection cache (no
+	// storage hit, no shared lock). If the user isn't joined, refuse.
+	chanID, ok := c.joinedChannels[m.Channel]
+	if !ok {
+		c.sendError("not_in_channel", "join the channel before sending", m.ID)
+		return
+	}
 	ch := c.srv.channels.Get(c.tenantID, chanID)
 	if ch == nil {
-		c.sendError("not_in_channel", "join the channel before sending", m.ID)
+		delete(c.joinedChannels, m.Channel)
+		c.sendError("not_in_channel", "channel no longer in memory; rejoin", m.ID)
 		return
 	}
 	// Server-stamp From + TS, encode the broadcast frame once, fan out.
