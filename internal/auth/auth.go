@@ -20,6 +20,7 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
@@ -225,4 +226,55 @@ func ComputeClientProof(password string, salt []byte, params string) ([]byte, er
 		return nil, fmt.Errorf("auth client proof: %w", err)
 	}
 	return argon2.IDKey([]byte(password), salt, iters, mem, par, keyLen), nil
+}
+
+// --- token-method auth (bot accounts) ---
+
+// IssueToken generates a fresh API token for the given bot account, stores
+// the SHA-256 hash, and returns the plaintext token. The plaintext is shown
+// to the caller exactly once -- it is not recoverable from storage. The
+// stored token's database row is also returned (with ID populated) so the
+// caller can echo metadata.
+//
+// Token format: a URL-safe base64 string with 32 bytes of entropy.
+func IssueToken(ctx context.Context, s storage.Store, tenantID, accountID uuid.UUID, label string) (plaintext string, tok *storage.Token, err error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", nil, fmt.Errorf("auth: token entropy: %w", err)
+	}
+	plaintext = base64.RawURLEncoding.EncodeToString(raw)
+	h := sha256.Sum256([]byte(plaintext))
+	t, err := s.CreateToken(ctx, tenantID, accountID, h[:], label)
+	if err != nil {
+		return "", nil, fmt.Errorf("auth: store token: %w", err)
+	}
+	return plaintext, t, nil
+}
+
+// AuthenticateToken looks up a bearer token by its SHA-256 hash. On
+// success returns the resolved account + tenant + the token row (so the
+// caller can opportunistically TouchTokenLastUsed). Returns
+// ErrUnauthenticated for any "this token isn't valid" condition; the
+// reason isn't surfaced to the wire.
+func AuthenticateToken(ctx context.Context, s storage.Store, plaintext string) (*Result, *storage.Token, error) {
+	if plaintext == "" {
+		return &Result{Reason: "invalid_credentials"}, nil, nil
+	}
+	h := sha256.Sum256([]byte(plaintext))
+	tok, err := s.GetTokenByHash(ctx, h[:])
+	if err != nil {
+		return &Result{Reason: "invalid_credentials"}, nil, nil
+	}
+	tenant, err := s.GetTenantByID(ctx, tok.TenantID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("auth token: lookup tenant: %w", err)
+	}
+	if tenant.Status == storage.TenantSuspended {
+		return &Result{Reason: "tenant_suspended"}, nil, nil
+	}
+	acc, err := s.GetAccountByID(ctx, tok.TenantID, tok.AccountID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("auth token: lookup account: %w", err)
+	}
+	return &Result{OK: true, Account: acc, Tenant: tenant}, tok, nil
 }

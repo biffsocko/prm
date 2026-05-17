@@ -200,6 +200,16 @@ func (f *fixture) runRound(tb testing.TB) []time.Duration {
 // ---------- TestFanoutLatency: prints a clean stats summary ----------
 
 func TestFanoutLatency(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping fan-out benchmark in short mode")
+	}
+	if isRace {
+		// Latency numbers under -race are meaningless (the race detector
+		// inflates timings ~10x and serializes memory access). Skip
+		// rather than report misleading data; correctness of the fan-out
+		// path is exercised by the server package's e2e tests with -race.
+		t.Skip("fan-out latency benchmark skipped under -race; numbers would be misleading")
+	}
 	for _, n := range []int{10, 50, 100} {
 		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
 			f := setup(t, n)

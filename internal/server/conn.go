@@ -324,24 +324,27 @@ func (c *Conn) handleHello(h proto.Hello) {
 }
 
 func (c *Conn) handleAuthRequest(ctx context.Context, r proto.AuthRequest) {
-	if r.Method != proto.AuthMethodPassword {
-		// Token method comes in slice 2.
-		c.sendFrame(proto.AuthErr{ID: r.ID, Reason: "unsupported_method", Detail: "only password method is supported in slice 1"})
-		return
+	switch r.Method {
+	case proto.AuthMethodPassword:
+		c.handlePasswordAuthRequest(ctx, r)
+	case proto.AuthMethodToken:
+		c.handleTokenAuthRequest(ctx, r)
+	default:
+		c.sendFrame(proto.AuthErr{ID: r.ID, Reason: "unsupported_method", Detail: "supported methods: password, token"})
 	}
+}
+
+func (c *Conn) handlePasswordAuthRequest(ctx context.Context, r proto.AuthRequest) {
 	if r.Tenant == "" || r.Username == "" {
 		c.sendFrame(proto.AuthErr{ID: r.ID, Reason: "invalid_request", Detail: "tenant and username are required for password method"})
 		return
 	}
 	chal, _, err := c.srv.beginPasswordAuth(ctx, r.Tenant, r.Username)
 	if err != nil {
-		// Map errors to wire-safe reasons. Don't distinguish "no such user"
-		// from "bad password"; both surface as invalid_credentials.
 		reason := authErrorReason(err)
 		c.sendFrame(proto.AuthErr{ID: r.ID, Reason: reason})
 		return
 	}
-	// Stash the in-flight challenge on the conn for the matching response.
 	c.pendingChal = chal
 	c.sendFrame(proto.AuthChallenge{
 		ID:     r.ID,
@@ -349,6 +352,45 @@ func (c *Conn) handleAuthRequest(ctx context.Context, r proto.AuthRequest) {
 		Nonce:  base64encode(chal.Nonce),
 		Params: chal.Params,
 	})
+}
+
+// handleTokenAuthRequest is a one-shot: the AuthRequest carries the bearer
+// token directly; the server responds with AuthOK or AuthErr immediately.
+// No challenge / response round-trip.
+func (c *Conn) handleTokenAuthRequest(ctx context.Context, r proto.AuthRequest) {
+	if r.Token == "" {
+		c.sendFrame(proto.AuthErr{ID: r.ID, Reason: "invalid_request", Detail: "token is required for token method"})
+		return
+	}
+	res, tok, err := auth.AuthenticateToken(ctx, c.srv.store, r.Token)
+	if err != nil {
+		c.log.Error("token auth failed", "err", err)
+		c.sendFrame(proto.AuthErr{ID: r.ID, Reason: "internal"})
+		return
+	}
+	if !res.OK {
+		c.sendFrame(proto.AuthErr{ID: r.ID, Reason: res.Reason})
+		return
+	}
+	// Fire-and-forget last-used update; doesn't gate the auth response.
+	if tok != nil {
+		go func(id uuid.UUID) {
+			_ = c.srv.store.TouchTokenLastUsed(context.Background(), id)
+		}(tok.ID)
+	}
+	c.tenantID = res.Tenant.ID
+	c.accountID = res.Account.ID
+	c.displayName = res.Account.DisplayName
+	c.authed.Store(true)
+	c.log = c.log.With("tenant", res.Tenant.Slug, "account", res.Account.Username, "method", "token")
+	c.sendFrame(proto.AuthOK{
+		ID:          r.ID,
+		AccountID:   res.Account.ID.String(),
+		TenantID:    res.Tenant.ID.String(),
+		AccountType: string(res.Account.Type),
+		DisplayName: res.Account.DisplayName,
+	})
+	c.log.Info("authenticated")
 }
 
 func (c *Conn) handleAuthResponse(ctx context.Context, r proto.AuthResponse) {
