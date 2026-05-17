@@ -5,12 +5,17 @@
 //	prmd serve [--addr :6697] [--storage sqlite:./prm.db] [--dev | --cert FILE --key FILE]
 //	prmd admin create-tenant [--display-name NAME] [--storage URL] <slug>
 //	prmd admin create-account [--password PW] [--bot] [--display-name NAME] [--storage URL] <tenant-slug> <username>
+//	prmd admin create-channel [--public] [--storage URL] <tenant-slug> <channel-name> <owner-username>
+//	prmd admin grant [--storage URL] <tenant-slug> <channel-name> <username> <role>
+//	prmd admin revoke [--storage URL] <tenant-slug> <channel-name> <username>
+//	prmd admin issue-token [--label LABEL] [--storage URL] <tenant-slug> <bot-username>
+//	prmd admin revoke-token [--storage URL] <tenant-slug> <token-id>
 //	prmd admin generate-cert [--out-dir ./certs] <host>
 //	prmd admin list-tenants [--storage URL]
+//	prmd admin list-channels [--storage URL] <tenant-slug>
 //
 // The --storage flag defaults to sqlite:./prm.db. Use
-// "postgres://user:pass@host:5432/db?sslmode=..." for the Postgres backend
-// (stub in slice 1).
+// "postgres://user:pass@host:5432/db?sslmode=..." for the Postgres backend.
 package main
 
 import (
@@ -23,6 +28,8 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/google/uuid"
 
 	"github.com/biffsocko/prm/internal/auth"
 	"github.com/biffsocko/prm/internal/server"
@@ -50,10 +57,22 @@ func main() {
 			os.Exit(cmdCreateTenant(os.Args[3:]))
 		case "create-account":
 			os.Exit(cmdCreateAccount(os.Args[3:]))
+		case "create-channel":
+			os.Exit(cmdCreateChannel(os.Args[3:]))
+		case "grant":
+			os.Exit(cmdGrant(os.Args[3:]))
+		case "revoke":
+			os.Exit(cmdRevoke(os.Args[3:]))
+		case "issue-token":
+			os.Exit(cmdIssueToken(os.Args[3:]))
+		case "revoke-token":
+			os.Exit(cmdRevokeToken(os.Args[3:]))
 		case "generate-cert":
 			os.Exit(cmdGenerateCert(os.Args[3:]))
 		case "list-tenants":
 			os.Exit(cmdListTenants(os.Args[3:]))
+		case "list-channels":
+			os.Exit(cmdListChannels(os.Args[3:]))
 		default:
 			usage(os.Stderr)
 			os.Exit(2)
@@ -77,8 +96,14 @@ Usage (flags come BEFORE positional args):
   prmd serve [flags]
   prmd admin create-tenant [flags] <slug>
   prmd admin create-account [flags] <tenant-slug> <username>
+  prmd admin create-channel [flags] <tenant-slug> <channel-name> <owner-username>
+  prmd admin grant [flags] <tenant-slug> <channel-name> <username> <role>
+  prmd admin revoke [flags] <tenant-slug> <channel-name> <username>
+  prmd admin issue-token [flags] <tenant-slug> <bot-username>
+  prmd admin revoke-token [flags] <tenant-slug> <token-id>
   prmd admin generate-cert [flags] <host>
   prmd admin list-tenants [flags]
+  prmd admin list-channels [flags] <tenant-slug>
   prmd version
 
 Run any subcommand with -h to see its flags.
@@ -283,6 +308,273 @@ func cmdListTenants(args []string) int {
 	fmt.Printf("%-36s  %-16s  %-8s  %s\n", "ID", "SLUG", "STATUS", "DISPLAY NAME")
 	for _, t := range list {
 		fmt.Printf("%-36s  %-16s  %-8s  %s\n", t.ID, t.Slug, t.Status, t.DisplayName)
+	}
+	return 0
+}
+
+// --- slice 2 admin commands ---
+
+func cmdCreateChannel(args []string) int {
+	fs := flag.NewFlagSet("create-channel", flag.ExitOnError)
+	public := fs.Bool("public", false, "make the channel public (any authenticated account in tenant may JOIN); default is private")
+	storageURL := fs.String("storage", "sqlite:./prm.db", "storage backend URL")
+	_ = fs.Parse(args)
+	if fs.NArg() != 3 {
+		fmt.Fprintln(os.Stderr, "usage: prmd admin create-channel [flags] <tenant-slug> <channel-name> <owner-username>")
+		return 2
+	}
+	tenantSlug := fs.Arg(0)
+	channelName := fs.Arg(1)
+	ownerUsername := fs.Arg(2)
+	vis := storage.ChannelPrivate
+	if *public {
+		vis = storage.ChannelPublic
+	}
+
+	log := newLogger()
+	st, err := bringUpStorage(*storageURL, log)
+	if err != nil {
+		log.Error("storage open", "err", err)
+		return 1
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	ten, err := st.GetTenantBySlug(ctx, tenantSlug)
+	if err != nil {
+		log.Error("lookup tenant", "err", err)
+		return 1
+	}
+	owner, err := st.GetAccountByUsername(ctx, ten.ID, ownerUsername)
+	if err != nil {
+		log.Error("lookup owner account", "err", err)
+		return 1
+	}
+	ch := &storage.Channel{Name: channelName, OwnerID: owner.ID, Visibility: vis}
+	if err := st.CreateChannel(ctx, ten.ID, ch); err != nil {
+		log.Error("create channel", "err", err)
+		return 1
+	}
+	// Owner gets RoleOwner in the ACL automatically.
+	if err := st.SetChannelACL(ctx, ten.ID, ch.ID, owner.ID, storage.RoleOwner, owner.ID); err != nil {
+		log.Error("set owner ACL", "err", err)
+		return 1
+	}
+	fmt.Printf("Created channel\n  ID:         %s\n  Tenant:     %s (%s)\n  Name:       %s\n  Owner:      %s (%s)\n  Visibility: %s\n",
+		ch.ID, ten.Slug, ten.ID, ch.Name, owner.Username, owner.ID, ch.Visibility)
+	return 0
+}
+
+func cmdGrant(args []string) int {
+	fs := flag.NewFlagSet("grant", flag.ExitOnError)
+	storageURL := fs.String("storage", "sqlite:./prm.db", "storage backend URL")
+	_ = fs.Parse(args)
+	if fs.NArg() != 4 {
+		fmt.Fprintln(os.Stderr, "usage: prmd admin grant [flags] <tenant-slug> <channel-name> <username> <role>")
+		fmt.Fprintln(os.Stderr, "  role: owner | admin | member | banned")
+		return 2
+	}
+	tenantSlug, channelName, username, roleStr := fs.Arg(0), fs.Arg(1), fs.Arg(2), fs.Arg(3)
+	role := storage.ChannelRole(roleStr)
+	switch role {
+	case storage.RoleOwner, storage.RoleAdmin, storage.RoleMember, storage.RoleBanned:
+	default:
+		fmt.Fprintf(os.Stderr, "invalid role %q; must be owner | admin | member | banned\n", roleStr)
+		return 2
+	}
+
+	log := newLogger()
+	st, err := bringUpStorage(*storageURL, log)
+	if err != nil {
+		log.Error("storage open", "err", err)
+		return 1
+	}
+	defer st.Close()
+	ctx := context.Background()
+	ten, err := st.GetTenantBySlug(ctx, tenantSlug)
+	if err != nil {
+		log.Error("lookup tenant", "err", err)
+		return 1
+	}
+	ch, err := st.GetChannelByName(ctx, ten.ID, channelName)
+	if err != nil {
+		log.Error("lookup channel", "err", err)
+		return 1
+	}
+	acc, err := st.GetAccountByUsername(ctx, ten.ID, username)
+	if err != nil {
+		log.Error("lookup account", "err", err)
+		return 1
+	}
+	if err := st.SetChannelACL(ctx, ten.ID, ch.ID, acc.ID, role, ch.OwnerID); err != nil {
+		log.Error("set acl", "err", err)
+		return 1
+	}
+	fmt.Printf("Granted %s on #%s in %s to %s\n", role, ch.Name, ten.Slug, acc.Username)
+	return 0
+}
+
+func cmdRevoke(args []string) int {
+	fs := flag.NewFlagSet("revoke", flag.ExitOnError)
+	storageURL := fs.String("storage", "sqlite:./prm.db", "storage backend URL")
+	_ = fs.Parse(args)
+	if fs.NArg() != 3 {
+		fmt.Fprintln(os.Stderr, "usage: prmd admin revoke [flags] <tenant-slug> <channel-name> <username>")
+		return 2
+	}
+	tenantSlug, channelName, username := fs.Arg(0), fs.Arg(1), fs.Arg(2)
+
+	log := newLogger()
+	st, err := bringUpStorage(*storageURL, log)
+	if err != nil {
+		log.Error("storage open", "err", err)
+		return 1
+	}
+	defer st.Close()
+	ctx := context.Background()
+	ten, err := st.GetTenantBySlug(ctx, tenantSlug)
+	if err != nil {
+		log.Error("lookup tenant", "err", err)
+		return 1
+	}
+	ch, err := st.GetChannelByName(ctx, ten.ID, channelName)
+	if err != nil {
+		log.Error("lookup channel", "err", err)
+		return 1
+	}
+	acc, err := st.GetAccountByUsername(ctx, ten.ID, username)
+	if err != nil {
+		log.Error("lookup account", "err", err)
+		return 1
+	}
+	if err := st.RemoveChannelACL(ctx, ten.ID, ch.ID, acc.ID); err != nil {
+		log.Error("remove acl", "err", err)
+		return 1
+	}
+	fmt.Printf("Revoked ACL for %s on #%s in %s\n", acc.Username, ch.Name, ten.Slug)
+	return 0
+}
+
+func cmdIssueToken(args []string) int {
+	fs := flag.NewFlagSet("issue-token", flag.ExitOnError)
+	label := fs.String("label", "", "human-readable label for the token")
+	storageURL := fs.String("storage", "sqlite:./prm.db", "storage backend URL")
+	_ = fs.Parse(args)
+	if fs.NArg() != 2 {
+		fmt.Fprintln(os.Stderr, "usage: prmd admin issue-token [flags] <tenant-slug> <bot-username>")
+		return 2
+	}
+	tenantSlug, username := fs.Arg(0), fs.Arg(1)
+
+	log := newLogger()
+	st, err := bringUpStorage(*storageURL, log)
+	if err != nil {
+		log.Error("storage open", "err", err)
+		return 1
+	}
+	defer st.Close()
+	ctx := context.Background()
+	ten, err := st.GetTenantBySlug(ctx, tenantSlug)
+	if err != nil {
+		log.Error("lookup tenant", "err", err)
+		return 1
+	}
+	bot, err := st.GetAccountByUsername(ctx, ten.ID, username)
+	if err != nil {
+		log.Error("lookup account", "err", err)
+		return 1
+	}
+	if bot.Type != storage.AccountBot {
+		fmt.Fprintf(os.Stderr, "account %s is type %q, not 'bot'. Tokens are intended for bot accounts.\n", bot.Username, bot.Type)
+		return 1
+	}
+	plaintext, tok, err := auth.IssueToken(ctx, st, ten.ID, bot.ID, *label)
+	if err != nil {
+		log.Error("issue token", "err", err)
+		return 1
+	}
+	fmt.Printf("Issued token (shown ONCE -- save it now)\n")
+	fmt.Printf("  Token ID:    %s\n", tok.ID)
+	fmt.Printf("  Account:     %s (%s)\n", bot.Username, bot.ID)
+	fmt.Printf("  Tenant:      %s (%s)\n", ten.Slug, ten.ID)
+	if *label != "" {
+		fmt.Printf("  Label:       %s\n", *label)
+	}
+	fmt.Printf("  TOKEN:       %s\n", plaintext)
+	return 0
+}
+
+func cmdRevokeToken(args []string) int {
+	fs := flag.NewFlagSet("revoke-token", flag.ExitOnError)
+	storageURL := fs.String("storage", "sqlite:./prm.db", "storage backend URL")
+	_ = fs.Parse(args)
+	if fs.NArg() != 2 {
+		fmt.Fprintln(os.Stderr, "usage: prmd admin revoke-token [flags] <tenant-slug> <token-id>")
+		return 2
+	}
+	tenantSlug, tokenIDStr := fs.Arg(0), fs.Arg(1)
+	tokenID, err := uuid.Parse(tokenIDStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid token id %q: %v\n", tokenIDStr, err)
+		return 2
+	}
+
+	log := newLogger()
+	st, err := bringUpStorage(*storageURL, log)
+	if err != nil {
+		log.Error("storage open", "err", err)
+		return 1
+	}
+	defer st.Close()
+	ctx := context.Background()
+	ten, err := st.GetTenantBySlug(ctx, tenantSlug)
+	if err != nil {
+		log.Error("lookup tenant", "err", err)
+		return 1
+	}
+	if err := st.RevokeToken(ctx, ten.ID, tokenID); err != nil {
+		log.Error("revoke token", "err", err)
+		return 1
+	}
+	fmt.Printf("Revoked token %s in %s\n", tokenID, ten.Slug)
+	return 0
+}
+
+func cmdListChannels(args []string) int {
+	fs := flag.NewFlagSet("list-channels", flag.ExitOnError)
+	storageURL := fs.String("storage", "sqlite:./prm.db", "storage backend URL")
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "usage: prmd admin list-channels [flags] <tenant-slug>")
+		return 2
+	}
+	tenantSlug := fs.Arg(0)
+
+	log := newLogger()
+	st, err := bringUpStorage(*storageURL, log)
+	if err != nil {
+		log.Error("storage open", "err", err)
+		return 1
+	}
+	defer st.Close()
+	ctx := context.Background()
+	ten, err := st.GetTenantBySlug(ctx, tenantSlug)
+	if err != nil {
+		log.Error("lookup tenant", "err", err)
+		return 1
+	}
+	list, err := st.ListChannels(ctx, ten.ID)
+	if err != nil {
+		log.Error("list channels", "err", err)
+		return 1
+	}
+	if len(list) == 0 {
+		fmt.Printf("(no channels in %s)\n", ten.Slug)
+		return 0
+	}
+	fmt.Printf("%-36s  %-16s  %-9s  %s\n", "ID", "NAME", "VIS", "OWNER")
+	for _, ch := range list {
+		fmt.Printf("%-36s  %-16s  %-9s  %s\n", ch.ID, ch.Name, ch.Visibility, ch.OwnerID)
 	}
 	return 0
 }
