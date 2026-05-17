@@ -35,12 +35,13 @@ import (
 func main() {
 	fs := flag.NewFlagSet("prm", flag.ExitOnError)
 	insecure := fs.Bool("insecure", false, "skip TLS verification (for dev self-signed certs)")
+	token := fs.String("token", "", "use token-method auth instead of password (overrides password)")
 	displayName := fs.String("display-name", "", "(unused in slice 1; reserved)")
 	_ = displayName
 	_ = fs.Parse(os.Args[1:])
 
 	if fs.NArg() != 4 {
-		fmt.Fprintln(os.Stderr, "usage: prm [--insecure] <server-addr> <tenant> <username> <channel>")
+		fmt.Fprintln(os.Stderr, "usage: prm [--insecure] [--token TOKEN] <server-addr> <tenant> <username> <channel>")
 		os.Exit(2)
 	}
 	addr := fs.Arg(0)
@@ -48,32 +49,38 @@ func main() {
 	username := fs.Arg(2)
 	channel := fs.Arg(3)
 
-	password := os.Getenv("PRM_PASSWORD")
-	if password == "" {
-		fmt.Printf("Password for %s@%s: ", username, tenant)
-		pw, err := term.ReadPassword(int(os.Stdin.Fd()))
-		fmt.Println()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "read password:", err)
-			os.Exit(1)
+	creds := credentials{
+		addr:     addr,
+		tenant:   tenant,
+		username: username,
+		channel:  channel,
+		token:    *token,
+		insecure: *insecure,
+	}
+	if creds.token == "" {
+		password := os.Getenv("PRM_PASSWORD")
+		if password == "" {
+			fmt.Printf("Password for %s@%s: ", username, tenant)
+			pw, err := term.ReadPassword(int(os.Stdin.Fd()))
+			fmt.Println()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "read password:", err)
+				os.Exit(1)
+			}
+			password = string(pw)
 		}
-		password = string(pw)
+		creds.password = password
 	}
 
-	tlsCfg := &tls.Config{
-		ServerName:         hostFromAddr(addr),
-		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: *insecure,
-	}
-
-	cli, err := dialAndAuth(addr, tlsCfg, tenant, username, password)
+	cli, err := dialAndAuth(creds)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "connect:", err)
 		os.Exit(1)
 	}
 
-	model := newModel(cli, channel, username)
+	model := newModel(cli, creds)
 	p := tea.NewProgram(model, tea.WithAltScreen())
+	model.prog = p
 
 	// Run a reader goroutine that pushes incoming frames as tea messages.
 	go cli.pumpInto(p)
@@ -83,6 +90,25 @@ func main() {
 		os.Exit(1)
 	}
 	cli.close()
+}
+
+// credentials carries everything needed to (re)establish a session.
+type credentials struct {
+	addr     string
+	tenant   string
+	username string
+	channel  string
+	password string // empty if using token
+	token    string // empty if using password
+	insecure bool
+}
+
+func (c credentials) tlsConfig() *tls.Config {
+	return &tls.Config{
+		ServerName:         hostFromAddr(c.addr),
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: c.insecure,
+	}
 }
 
 func hostFromAddr(addr string) string {
@@ -103,9 +129,9 @@ type prmClient struct {
 	closed chan struct{}
 }
 
-func dialAndAuth(addr string, tlsCfg *tls.Config, tenant, username, password string) (*prmClient, error) {
+func dialAndAuth(creds credentials) (*prmClient, error) {
 	d := &net.Dialer{Timeout: 5 * time.Second}
-	c, err := tls.DialWithDialer(d, "tcp", addr, tlsCfg)
+	c, err := tls.DialWithDialer(d, "tcp", creds.addr, creds.tlsConfig())
 	if err != nil {
 		return nil, fmt.Errorf("dial: %w", err)
 	}
@@ -117,28 +143,38 @@ func dialAndAuth(addr string, tlsCfg *tls.Config, tenant, username, password str
 	if err := cli.expectType(proto.TypeWelcome); err != nil {
 		return nil, err
 	}
-	if err := cli.send(proto.AuthRequest{Method: proto.AuthMethodPassword, Tenant: tenant, Username: username}); err != nil {
-		return nil, err
+
+	if creds.token != "" {
+		// Token-method auth: one-shot, no challenge.
+		if err := cli.send(proto.AuthRequest{Method: proto.AuthMethodToken, Token: creds.token}); err != nil {
+			return nil, err
+		}
+	} else {
+		// Password-method auth: 3-frame handshake.
+		if err := cli.send(proto.AuthRequest{Method: proto.AuthMethodPassword, Tenant: creds.tenant, Username: creds.username}); err != nil {
+			return nil, err
+		}
+		chalF, err := cli.expectAny(proto.TypeAuthChallenge, proto.TypeAuthErr)
+		if err != nil {
+			return nil, err
+		}
+		if errFrame, ok := chalF.(proto.AuthErr); ok {
+			return nil, fmt.Errorf("auth failed: %s %s", errFrame.Reason, errFrame.Detail)
+		}
+		chal := chalF.(proto.AuthChallenge)
+		saltBytes, err := auth.DecodeBase64(chal.Salt)
+		if err != nil {
+			return nil, fmt.Errorf("bad challenge salt: %w", err)
+		}
+		proof, err := auth.ComputeClientProof(creds.password, saltBytes, chal.Params)
+		if err != nil {
+			return nil, fmt.Errorf("compute proof: %w", err)
+		}
+		if err := cli.send(proto.AuthResponse{Proof: auth.EncodeBase64(proof)}); err != nil {
+			return nil, err
+		}
 	}
-	chalF, err := cli.expectAny(proto.TypeAuthChallenge, proto.TypeAuthErr)
-	if err != nil {
-		return nil, err
-	}
-	if errFrame, ok := chalF.(proto.AuthErr); ok {
-		return nil, fmt.Errorf("auth failed: %s %s", errFrame.Reason, errFrame.Detail)
-	}
-	chal := chalF.(proto.AuthChallenge)
-	saltBytes, err := auth.DecodeBase64(chal.Salt)
-	if err != nil {
-		return nil, fmt.Errorf("bad challenge salt: %w", err)
-	}
-	proof, err := auth.ComputeClientProof(password, saltBytes, chal.Params)
-	if err != nil {
-		return nil, fmt.Errorf("compute proof: %w", err)
-	}
-	if err := cli.send(proto.AuthResponse{Proof: auth.EncodeBase64(proof)}); err != nil {
-		return nil, err
-	}
+
 	okF, err := cli.expectAny(proto.TypeAuthOK, proto.TypeAuthErr)
 	if err != nil {
 		return nil, err
@@ -237,7 +273,7 @@ type disconnectMsg struct{ err error }
 
 type model struct {
 	cli       *prmClient
-	channel   string
+	creds     credentials
 	myName    string
 	input     textinput.Model
 	view      viewport.Model
@@ -246,6 +282,11 @@ type model struct {
 	height    int
 	err       error
 	joined    bool
+
+	// Reconnect bookkeeping.
+	reconnecting bool
+	reconnectN   int // attempt number, starts at 1
+	prog         *tea.Program // set after newProgram so reconnect goroutines can Send
 }
 
 var (
@@ -256,25 +297,36 @@ var (
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
 )
 
-func newModel(c *prmClient, channel, myName string) *model {
+func newModel(c *prmClient, creds credentials) *model {
 	ti := textinput.New()
 	ti.Placeholder = "type a message and press Enter (or /quit)"
 	ti.Focus()
 	ti.CharLimit = 4096
 	vp := viewport.New(80, 20)
-	return &model{cli: c, channel: channel, myName: myName, input: ti, view: vp}
+	return &model{cli: c, creds: creds, myName: creds.username, input: ti, view: vp}
 }
 
 func (m *model) Init() tea.Cmd {
 	// Send Join on first frame. Returned as a tea.Cmd so it happens after the
 	// program starts and any size events have settled.
 	return func() tea.Msg {
-		_ = m.cli.send(proto.Join{Channel: m.channel})
+		_ = m.cli.send(proto.Join{Channel: m.creds.channel})
 		return joinedMsg{}
 	}
 }
 
 type joinedMsg struct{}
+
+// reconnectedMsg is sent when a reconnect attempt succeeds.
+type reconnectedMsg struct{ cli *prmClient }
+
+// reconnectFailedMsg is sent when a reconnect attempt fails; carries the
+// next backoff so the model can schedule a retry.
+type reconnectFailedMsg struct {
+	attempt int
+	err     error
+	nextIn  time.Duration
+}
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
@@ -300,7 +352,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			if text != "" {
-				if err := m.cli.send(proto.Msg{Channel: m.channel, Body: text}); err != nil {
+				if err := m.cli.send(proto.Msg{Channel: m.creds.channel, Body: text}); err != nil {
 					m.appendLine(errStyle.Render("send: " + err.Error()))
 				}
 			}
@@ -308,7 +360,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case joinedMsg:
 		m.joined = true
-		m.appendLine(systemStyle.Render(fmt.Sprintf("** joined #%s **", m.channel)))
+		m.appendLine(systemStyle.Render(fmt.Sprintf("** joined #%s **", m.creds.channel)))
 
 	case chatMsg:
 		ts := msg.ts.Local().Format("15:04:05")
@@ -340,9 +392,32 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendLine(errStyle.Render(fmt.Sprintf("server error: %s %s", msg.reason, msg.detail)))
 
 	case disconnectMsg:
-		m.err = msg.err
-		m.appendLine(errStyle.Render("disconnected: " + msg.err.Error()))
-		return m, tea.Quit
+		// Don't quit on disconnect -- start reconnect with backoff.
+		if m.reconnecting {
+			break
+		}
+		m.reconnecting = true
+		m.reconnectN = 1
+		m.appendLine(errStyle.Render("disconnected: " + msg.err.Error() + " (reconnecting...)"))
+		return m, m.scheduleReconnect(0)
+
+	case reconnectFailedMsg:
+		m.appendLine(errStyle.Render(fmt.Sprintf("reconnect attempt %d failed: %v -- retrying in %s",
+			msg.attempt, msg.err, msg.nextIn)))
+		m.reconnectN = msg.attempt + 1
+		return m, m.scheduleReconnect(msg.nextIn)
+
+	case reconnectedMsg:
+		m.cli = msg.cli
+		m.reconnecting = false
+		m.reconnectN = 0
+		m.appendLine(systemStyle.Render(fmt.Sprintf("** reconnected; rejoining #%s **", m.creds.channel)))
+		go m.cli.pumpInto(m.prog)
+		// Re-join the channel after reconnect.
+		return m, func() tea.Msg {
+			_ = m.cli.send(proto.Join{Channel: m.creds.channel})
+			return nil
+		}
 	}
 
 	var cmd tea.Cmd
@@ -352,6 +427,38 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	cmds = append(cmds, cmd)
 
 	return m, tea.Batch(cmds...)
+}
+
+// scheduleReconnect returns a tea.Cmd that sleeps for delay, then attempts a
+// new dialAndAuth. On success emits reconnectedMsg; on failure emits
+// reconnectFailedMsg with the next backoff.
+func (m *model) scheduleReconnect(delay time.Duration) tea.Cmd {
+	attempt := m.reconnectN
+	creds := m.creds
+	return func() tea.Msg {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		cli, err := dialAndAuth(creds)
+		if err != nil {
+			return reconnectFailedMsg{
+				attempt: attempt,
+				err:     err,
+				nextIn:  backoffFor(attempt),
+			}
+		}
+		return reconnectedMsg{cli: cli}
+	}
+}
+
+// backoffFor returns the delay before the next reconnect attempt.
+// Exponential with a 30s cap: 1s, 2s, 4s, 8s, 16s, 30s, 30s, ...
+func backoffFor(attempt int) time.Duration {
+	d := time.Second << attempt // 1s, 2s, 4s, 8s, 16s, 32s, ...
+	if d > 30*time.Second || d < 0 {
+		return 30 * time.Second
+	}
+	return d
 }
 
 func (m *model) appendLine(line string) {
@@ -364,7 +471,11 @@ func (m *model) appendLine(line string) {
 }
 
 func (m *model) View() string {
-	status := systemStyle.Render(fmt.Sprintf("#%s -- %s -- Ctrl-C to quit", m.channel, m.myName))
+	connState := ""
+	if m.reconnecting {
+		connState = errStyle.Render(fmt.Sprintf(" -- RECONNECTING (attempt %d)", m.reconnectN))
+	}
+	status := systemStyle.Render(fmt.Sprintf("#%s -- %s -- Ctrl-C to quit", m.creds.channel, m.myName)) + connState
 	return fmt.Sprintf("%s\n%s\n%s", m.view.View(), m.input.View(), status)
 }
 
