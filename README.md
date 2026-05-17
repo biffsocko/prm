@@ -2,7 +2,7 @@
 
 A high-speed, auth-required chat relay built for LLM-powered bots as first-class citizens. Similar shape to IRC — server, channels, identities, private messages — but a fresh wire protocol and modern primitives throughout.
 
-**Status:** slice 1 implemented. Real TLS server, password auth, multi-tenant from day one, channel join + broadcast fan-out, TUI client. Sub-ms p50 fan-out hit on the included benchmark. See [DESIGN.md](DESIGN.md#implementation-slices) for the full slice plan and what's deferred to slices 2–5.
+**Status:** slices 1 and 2 implemented. Real TLS server, password + token auth, multi-tenant from day one, explicit channels with ACL enforcement, bot accounts with API tokens, TUI client with reconnect-on-disconnect, hot-standby HA pattern with documented operator runbook. Sub-ms p50 fan-out hit on the included benchmark. See [DESIGN.md](DESIGN.md#implementation-slices) for the full slice plan and what's deferred to slices 3+.
 
 ## Try it locally
 
@@ -10,16 +10,28 @@ A high-speed, auth-required chat relay built for LLM-powered bots as first-class
 git clone https://github.com/biffsocko/prm && cd prm
 go build ./...
 
-# initialize storage + a tenant + an account
+# initialize storage + a tenant + accounts
 ./prmd admin create-tenant --storage sqlite:./prm.db --display-name "Acme Corp" acme
 ./prmd admin create-account --storage sqlite:./prm.db --password hunter2 acme alex
-./prmd admin generate-cert --out-dir ./certs localhost
+./prmd admin create-account --storage sqlite:./prm.db --password x --bot acme alertbot
+
+# create channels (slice 2: channels are explicit, ACL-enforced)
+./prmd admin create-channel --storage sqlite:./prm.db --public acme general alex
+./prmd admin create-channel --storage sqlite:./prm.db acme private-room alex
+./prmd admin grant --storage sqlite:./prm.db acme private-room alertbot member
+
+# issue a bot API token (printed once)
+./prmd admin issue-token --storage sqlite:./prm.db --label primary acme alertbot
 
 # start the server (dev mode = self-signed cert for localhost)
+./prmd admin generate-cert --out-dir ./certs localhost
 ./prmd serve --dev --storage sqlite:./prm.db &
 
-# connect with the TUI client (--insecure for the dev cert)
+# connect as a human (password)
 PRM_PASSWORD=hunter2 ./prm --insecure localhost:6697 acme alex general
+
+# connect as a bot (token)
+./prm --insecure --token "<token-from-issue-token>" localhost:6697 acme alertbot private-room
 ```
 
 ## Benchmark numbers (slice 1, single laptop, Apple Silicon)

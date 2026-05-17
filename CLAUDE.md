@@ -10,15 +10,28 @@ The standout design choice: **server-side filter pushdown for bot subscriptions.
 
 ## Project state
 
-**Slice 1 complete.** A working TLS PRM server (`prmd`) and reference TUI client (`prm`) with multi-tenant SQLite storage, password auth, one public channel per tenant, broadcast fan-out, and end-to-end tests + a fan-out latency benchmark. Postgres backend is a stub awaiting a real Postgres to test against. Slices 2–5 (ACLs, bot tokens, HA, webhooks, inbound integrations) are still ahead — see [DESIGN.md](DESIGN.md#implementation-slices).
+**Slices 1 and 2 complete.** A working TLS PRM server (`prmd`) and reference TUI client (`prm`) with:
 
-Headline numbers from `go test -run TestFanoutLatency -v ./test/bench/` on Apple Silicon:
+- Multi-tenant SQLite storage; Postgres backend is a stub awaiting a real Postgres to validate against
+- Password auth (Argon2id, 3-frame challenge/response handshake)
+- Token auth (one-shot bearer-token method for bot accounts)
+- Explicit channels (slice 2: channels must be created; first JOIN no longer auto-creates)
+- Channel ACLs (owner / admin / member / banned roles); public visibility = any authenticated account in tenant; private = must be in ACL
+- Bot accounts as a distinct user type; API tokens issued via admin CLI (plaintext shown once)
+- Channel ID cached on the connection on JOIN so handleMsg's hot path never hits storage
+- TUI client with reconnect-on-disconnect (exponential backoff 1s → 30s) — important under Tier 2 HA failover
+- HA leader-election skeleton (`internal/ha`): Local elector for single-instance; Postgres advisory-lock elector for hot-standby pairs. Integration test for Postgres is a documented skeleton (skipped until a real PG is available).
+- Operator runbook in `docs/HA.md` covering Tier 2 hot-standby setup, failover sequence, restore-from-backup, monthly restore-test discipline.
+
+Slices 3+ ahead (webhook subscriptions, inbound integrations, chat history, federation): see [DESIGN.md](DESIGN.md#implementation-slices).
+
+Headline numbers from `go test -p 1 -run TestFanoutLatency -v ./test/bench/` on Apple Silicon:
 
 - n=10  → p50=241µs, p99=761µs
 - n=50  → p50=291µs, p99=734µs
 - n=100 → p50=570µs, p99=1.89ms
 
-Sub-ms p50 fan-out target met. README documents the reproduction steps.
+Sub-ms p50 fan-out target met. The benchmark skips under `-race` (numbers would be misleading); correctness under `-race` is exercised by the server package's e2e tests.
 
 ## Hard constraints — don't break without asking
 
@@ -53,7 +66,11 @@ prm/
     channels/              # in-memory channel state, sharded locks, member list ops
     storage/               # storage interface + Postgres (primary) and SQLite (alt) implementations
                            # every function takes tenantID as a leading arg
-    ha/                    # leader election via Postgres advisory lock; standby lifecycle
+      open/                # factory: storage.Open(url) -> backend
+      sqlite/              # SQLite impl via modernc.org/sqlite (MaxOpenConns=1)
+      postgres/            # Postgres impl (stub; awaiting real PG for slice 1/2)
+    ha/                    # leader election: Local (always-leader) and Postgres
+                           # (pg_try_advisory_lock + heartbeat) implementations
     tenants/               # tenant model, quotas, settings, platform-admin operations
     rest/                  # HTTP control plane (account/channel/subscription/integration CRUD)
     webhook/               # subscription matcher, debounce buffer, signed HTTP POST worker pool

@@ -543,12 +543,12 @@ Slicing the build so each step ships something useful and validates the next:
 - Admin CLI: `prmd admin create-tenant`
 - Tier 1 backup config (Postgres WAL archive to object storage) documented in runbook
 
-**Slice 2 — Auth surface and HA.**
-- Channel ACLs persisted in Postgres
-- Bot account type + token-method auth
-- Hot-standby HA: leader election via Postgres advisory lock + L4 LB pattern documented
-- Documented restore runbook with a restore-test script
-- Reconnect logic in TUI client (essential under HA)
+**Slice 2 — Auth surface and HA. ✅ Implemented.**
+- Channel ACLs persisted in storage (SQLite full, Postgres stub) — enforced on JOIN; channels must exist explicitly (no implicit creation on first JOIN as in slice 1).
+- Bot account type + token-method auth (one-shot AuthRequest with bearer token; no challenge round-trip).
+- Hot-standby HA: leader election via Postgres `pg_try_advisory_lock` + L4 load balancer pattern. `internal/ha` package with `Local` (always-leader) and `Postgres` (advisory-lock + heartbeat) implementations.
+- Documented restore runbook in `docs/HA.md` covering Tier 2 topology, failover sequence, restore-from-backup, monthly restore-test discipline.
+- Reconnect logic in TUI client with exponential backoff (1s → 30s capped). Essential under HA failover (10–30s blip).
 
 **Slice 3 — Webhook subscriptions + outbound delivery.**
 - REST control plane subscription CRUD
