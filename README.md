@@ -2,7 +2,7 @@
 
 A high-speed, auth-required chat relay built for LLM-powered bots as first-class citizens. Similar shape to IRC — server, channels, identities, private messages — but a fresh wire protocol and modern primitives throughout.
 
-**Status:** slices 1, 2, and 3 implemented. Real TLS server, password + token auth, multi-tenant from day one, explicit channels with ACL enforcement, bot accounts with API tokens, TUI client with reconnect, hot-standby HA pattern with operator runbook, and **the headline value-prop layer: webhook subscriptions with server-side filter pushdown, debounce + cooldown + budget caps, HMAC-signed POSTs, and context-attach**. End-to-end test stands up the full stack (realtime + REST + webhook manager + fake bot) and verifies a chat message triggers a signed webhook with preceding messages attached. Sub-ms p50 fan-out preserved. See [DESIGN.md](DESIGN.md#implementation-slices) for the full slice plan.
+**Status:** slices 1 through 3b implemented. Real TLS server, password + token auth, multi-tenant from day one, explicit channels with ACL enforcement, bot accounts with API tokens, TUI client with reconnect, hot-standby HA pattern with operator runbook, **the headline value-prop layer: webhook subscriptions with server-side filter pushdown, debounce + cooldown + budget caps, HMAC-signed POSTs, and context-attach** — manageable via **both** the REST control plane (`curl`-friendly, port 8443) **and** native verbs on the realtime PRM protocol (no separate HTTP client needed for bots). End-to-end tests cover both paths. Sub-ms p50 fan-out preserved. See [DESIGN.md](DESIGN.md#implementation-slices) for the full slice plan.
 
 ## Try it locally
 
@@ -95,6 +95,31 @@ sequenceDiagram
 ```
 
 For the bot-author guide (creating subscriptions, verifying signatures, payload shape, retry policy, a complete minimal Python bot), see [docs/WEBHOOKS.md](docs/WEBHOOKS.md).
+
+Bots can manage subscriptions via either surface — same business logic underneath (`internal/subops`):
+
+```mermaid
+flowchart LR
+    subgraph clients
+        Curl[curl / language SDK]
+        Bot[Bot on PRM<br/>realtime socket]
+    end
+
+    subgraph prmd[prmd]
+        REST[REST :8443<br/>POST/GET/PATCH/DELETE<br/>/v1/subscriptions]
+        Proto[Realtime :6697<br/>subscription_create / _list /<br/>_get / _update / _delete]
+        Shared[internal/subops<br/>validate · resolve channel ·<br/>HMAC secret · isolation ·<br/>webhook-manager notify]
+        Mgr[Webhook manager<br/>matcher + worker pool]
+        Store[(Postgres / SQLite)]
+    end
+
+    Curl -->|HTTPS + Bearer token| REST
+    Bot -->|TLS + token auth| Proto
+    REST --> Shared
+    Proto --> Shared
+    Shared --> Store
+    Shared --> Mgr
+```
 
 
 ## Built for production deployments

@@ -289,10 +289,41 @@ Deploy as a Cloud Run / Lambda / etc. service. Zero idle cost: PRM only wakes yo
 
 ---
 
+## Subscription management over the realtime protocol
+
+Two ways to manage subscriptions, same business logic underneath:
+
+| Surface | When to use |
+|---|---|
+| REST on `:8443` | `curl`-friendly, easy bot SDKs in any language, no PRM client needed |
+| Native verbs on the PRM realtime protocol (`:6697`) | Bots that already speak PRM for chat — one socket, one auth, one protocol |
+
+The verb path uses these wire types (all under the existing token-method auth):
+
+```
+C -> S: subscription_create {channel_name, url, match, ...}
+S -> C: subscription_ok      {subscription: {id, secret, ...}}   // secret returned ONCE on create
+
+C -> S: subscription_list
+S -> C: subscription_list_ok {subscriptions: [...]}
+
+C -> S: subscription_get     {subscription_id}
+S -> C: subscription_ok      {subscription: {...}}              // secret omitted
+
+C -> S: subscription_update  {subscription_id, url?, match?, disabled?, ...}
+S -> C: subscription_ok      {subscription: {...}}
+
+C -> S: subscription_delete  {subscription_id}
+S -> C: subscription_deleted {subscription_id}
+```
+
+Errors come back via the existing `error` frame with stable reason codes: `bad_request`, `not_found`, `not_owner`, `not_a_bot`, `internal`. Only bot accounts can manage subscriptions (`not_a_bot` rejects human accounts).
+
+Field semantics, payload shape, signature verification, retry policy, and budget/debounce/cooldown behavior are all identical to the REST path — the REST handlers and the protocol handlers both delegate to `internal/subops`.
+
 ## What's still manual / out of scope
 
 - **@-mention parsing in the broadcast path.** The matcher supports a `mention` rule kind that checks against `Event.Mentions`, but the server doesn't yet auto-resolve `@displayname` references from message bodies. For now: use `regex` rules that match `account_id` strings (clunky) or wait for slice 5's mention parser.
 - **Outbound IP allowlisting.** PRM's webhook worker pool POSTs from whatever IP your prmd host runs on; if your bot is behind a strict firewall, you need to let that IP through. (No "static egress IP" guarantee from PRM yet.)
 - **Per-subscription `/v1/subscriptions/{id}/fires` endpoint** for audit — the `subscription_fires` table is populated, just not yet exposed via REST. Slice 4+.
-- **Web UI for subscription management.** REST + CLI only for now.
-- **Subscription management over the realtime protocol** (slice 3b). REST is the curl-friendly path; verb support over the chat socket lands later.
+- **Web UI for subscription management.** REST + CLI + PRM-protocol verbs only for now.
