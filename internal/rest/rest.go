@@ -44,6 +44,10 @@ type Config struct {
 	Store      storage.Store
 	Logger     *slog.Logger
 	WebhookMgr *webhook.Manager
+	// EventPublisher is the bridge to the realtime broadcast path. It
+	// republishes inbound integration events onto a channel. Nil
+	// disables the /v1/inbound/{id} endpoint (it'll return 501).
+	EventPublisher EventPublisher
 }
 
 // Server is the PRM HTTP control plane.
@@ -98,6 +102,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/subscriptions/{id}", s.auth(s.handleGetSubscription))
 	s.mux.HandleFunc("PATCH /v1/subscriptions/{id}", s.auth(s.handleUpdateSubscription))
 	s.mux.HandleFunc("DELETE /v1/subscriptions/{id}", s.auth(s.handleDeleteSubscription))
+	// Inbound integration POSTs use a different auth scheme (integration
+	// token, not bot API token), so handleInbound does its own bearer
+	// check rather than going through s.auth.
+	s.mux.HandleFunc("POST /v1/inbound/{id}", s.handleInbound)
 }
 
 // Serve listens until ctx is cancelled. Closes the listener on ctx cancel.

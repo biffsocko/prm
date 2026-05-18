@@ -170,11 +170,12 @@ func cmdServe(args []string) int {
 	// REST control plane on a separate listener (optional).
 	if *restAddr != "" {
 		restSrv, err := rest.New(rest.Config{
-			Addr:       *restAddr,
-			TLSConfig:  tlsCfg,
-			Store:      st,
-			Logger:     log,
-			WebhookMgr: mgr,
+			Addr:           *restAddr,
+			TLSConfig:      tlsCfg,
+			Store:          st,
+			Logger:         log,
+			WebhookMgr:     mgr,
+			EventPublisher: srv, // server.Server satisfies rest.EventPublisher
 		})
 		if err != nil {
 			log.Error("rest new", "err", err)
