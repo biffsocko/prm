@@ -78,6 +78,11 @@ func (s *Server) PublishInbound(ctx context.Context, tenantID, channelID, fromAc
 		Body:        body,
 	})
 
+	// Durable history persist (async; never blocks).
+	if s.history != nil {
+		s.history.enqueue(newStoredMessage(tenantID, channelID, fromAccountID, body, ts))
+	}
+
 	if s.webhooks != nil {
 		s.webhooks.Notify(webhook.Event{
 			TenantID:    tenantID,

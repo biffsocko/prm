@@ -225,6 +225,8 @@ func (c *Conn) dispatch(ctx context.Context, f proto.Frame) {
 		c.handleSubscriptionUpdate(ctx, v)
 	case proto.SubscriptionDelete:
 		c.handleSubscriptionDelete(ctx, v)
+	case proto.ChatHistory:
+		c.handleChatHistory(ctx, v)
 	default:
 		c.sendError("unsupported", fmt.Sprintf("verb %q not supported", f.FrameType()), "")
 	}
@@ -558,6 +560,11 @@ func (c *Conn) handleMsg(ctx context.Context, m proto.Msg) {
 		TS:          now,
 		Body:        m.Body,
 	})
+
+	// Durable history persist (async; never blocks). Off the hot path.
+	if c.srv.history != nil {
+		c.srv.history.enqueue(newStoredMessage(c.tenantID, chanID, c.accountID, m.Body, now))
+	}
 
 	// Notify the webhook manager off the hot path. The manager's
 	// Notify is non-blocking (matches push onto an internal worker

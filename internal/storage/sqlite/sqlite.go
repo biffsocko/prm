@@ -166,6 +166,18 @@ var migrations = []string{
 	) STRICT`,
 	`CREATE INDEX IF NOT EXISTS integrations_token_idx ON integrations(token_hash)`,
 	`CREATE INDEX IF NOT EXISTS integrations_tenant_idx ON integrations(tenant_id)`,
+	`CREATE TABLE IF NOT EXISTS messages (
+		id            TEXT PRIMARY KEY,
+		tenant_id     TEXT NOT NULL,
+		channel_id    TEXT NOT NULL,
+		from_account  TEXT NOT NULL,
+		body          TEXT NOT NULL,
+		ts            INTEGER NOT NULL,
+		created_at    INTEGER NOT NULL,
+		FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+	) STRICT`,
+	`CREATE INDEX IF NOT EXISTS messages_channel_ts_idx ON messages(tenant_id, channel_id, ts)`,
+	`CREATE INDEX IF NOT EXISTS messages_ts_idx ON messages(ts)`,
 }
 
 // CreateTenant inserts a new tenant. If t.ID is zero, a UUID v7 is generated.
@@ -880,6 +892,116 @@ func (s *Store) scanIntegration(r scanner) (*storage.Integration, error) {
 		out.DisabledAt = time.UnixMicro(disabledAt).UTC()
 	}
 	return out, nil
+}
+
+// --- stored messages (chat history) ---
+
+func (s *Store) RecordMessage(ctx context.Context, m *storage.StoredMessage) error {
+	if m.ID == uuid.Nil {
+		var err error
+		m.ID, err = uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("sqlite: generate message id: %w", err)
+		}
+	}
+	if m.CreatedAt.IsZero() {
+		m.CreatedAt = time.Now().UTC()
+	}
+	if m.TS.IsZero() {
+		m.TS = m.CreatedAt
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO messages (id, tenant_id, channel_id, from_account, body, ts, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		m.ID.String(), m.TenantID.String(), m.ChannelID.String(), m.FromAccountID.String(),
+		m.Body, m.TS.UnixMicro(), m.CreatedAt.UnixMicro(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite record message: %w", err)
+	}
+	return nil
+}
+
+// ListMessages returns up to limit messages from the given channel, ordered
+// oldest-first. If beforeTS is non-zero, only messages strictly older than
+// beforeTS are returned (so the client can paginate by feeding the oldest
+// returned ts back as beforeTS).
+func (s *Store) ListMessages(ctx context.Context, tenantID, channelID uuid.UUID, limit int, beforeTS time.Time) ([]*storage.StoredMessage, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	var rows *sql.Rows
+	var err error
+	if beforeTS.IsZero() {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT id, tenant_id, channel_id, from_account, body, ts, created_at
+			 FROM messages WHERE tenant_id = ? AND channel_id = ?
+			 ORDER BY ts DESC LIMIT ?`,
+			tenantID.String(), channelID.String(), limit)
+	} else {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT id, tenant_id, channel_id, from_account, body, ts, created_at
+			 FROM messages WHERE tenant_id = ? AND channel_id = ? AND ts < ?
+			 ORDER BY ts DESC LIMIT ?`,
+			tenantID.String(), channelID.String(), beforeTS.UnixMicro(), limit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("sqlite list messages: %w", err)
+	}
+	defer rows.Close()
+	// Build the slice newest-first, then reverse to return oldest-first.
+	var newestFirst []*storage.StoredMessage
+	for rows.Next() {
+		m, err := s.scanMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		newestFirst = append(newestFirst, m)
+	}
+	// Reverse.
+	for i, j := 0, len(newestFirst)-1; i < j; i, j = i+1, j-1 {
+		newestFirst[i], newestFirst[j] = newestFirst[j], newestFirst[i]
+	}
+	return newestFirst, rows.Err()
+}
+
+// PurgeMessagesOlderThan deletes messages older than now-retention.
+// Returns the number deleted. Caller decides when to call it (cron, admin
+// command, etc.); the storage layer has no automatic background sweeper.
+func (s *Store) PurgeMessagesOlderThan(ctx context.Context, retention time.Duration) (int, error) {
+	cutoff := time.Now().UTC().Add(-retention)
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM messages WHERE ts < ?`, cutoff.UnixMicro())
+	if err != nil {
+		return 0, fmt.Errorf("sqlite purge messages: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+func (s *Store) scanMessage(r scanner) (*storage.StoredMessage, error) {
+	var (
+		id, tenantID, channelID, fromAccount, body string
+		ts, createdAt                              int64
+	)
+	if err := r.Scan(&id, &tenantID, &channelID, &fromAccount, &body, &ts, &createdAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("sqlite scan message: %w", err)
+	}
+	msgID, _ := uuid.Parse(id)
+	tid, _ := uuid.Parse(tenantID)
+	cid, _ := uuid.Parse(channelID)
+	fid, _ := uuid.Parse(fromAccount)
+	return &storage.StoredMessage{
+		ID: msgID, TenantID: tid, ChannelID: cid, FromAccountID: fid,
+		Body:      body,
+		TS:        time.UnixMicro(ts).UTC(),
+		CreatedAt: time.UnixMicro(createdAt).UTC(),
+	}, nil
 }
 
 // --- helpers ---

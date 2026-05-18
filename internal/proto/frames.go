@@ -41,6 +41,8 @@ const (
 	TypeSubscriptionOK       = "subscription_ok"
 	TypeSubscriptionListOK   = "subscription_list_ok"
 	TypeSubscriptionDeleted  = "subscription_deleted"
+	TypeChatHistory          = "chathistory"
+	TypeChatHistoryOK        = "chathistory_ok"
 )
 
 // Auth methods.
@@ -323,6 +325,41 @@ type SubscriptionDeleted struct {
 }
 
 func (SubscriptionDeleted) FrameType() string { return TypeSubscriptionDeleted }
+
+// ChatHistory asks the server for stored channel history. Limit defaults
+// to 50 server-side, capped at 500. BeforeTS, if set, returns messages
+// strictly older than it -- use the oldest TS of the previous response
+// to page backwards.
+type ChatHistory struct {
+	Type     string    `json:"type"`
+	ID       string    `json:"id,omitempty"`
+	Channel  string    `json:"channel"`
+	Limit    int       `json:"limit,omitempty"`
+	BeforeTS time.Time `json:"before_ts,omitempty"`
+}
+
+func (ChatHistory) FrameType() string { return TypeChatHistory }
+
+// ChatHistoryOK is the server's response carrying oldest-first stored
+// messages from the requested channel. Empty Messages means "no more
+// history older than BeforeTS (or no messages at all)".
+type ChatHistoryOK struct {
+	Type     string             `json:"type"`
+	ID       string             `json:"id,omitempty"`
+	Channel  string             `json:"channel"`
+	Messages []StoredMessageWire `json:"messages"`
+}
+
+func (ChatHistoryOK) FrameType() string { return TypeChatHistoryOK }
+
+// StoredMessageWire is the wire shape for one stored chat message. Slim:
+// just the fields a backfilling client needs to render history.
+type StoredMessageWire struct {
+	ID   string    `json:"id"`
+	From string    `json:"from"` // account_id
+	TS   time.Time `json:"ts"`
+	Body string    `json:"body"`
+}
 
 // Error is the generic error frame. Reason is a stable machine-readable code
 // (e.g., "not_authenticated", "channel_not_found", "rate_limited"); Detail

@@ -58,6 +58,7 @@ type Server struct {
 	tenants  *tenants.Service
 	channels *channels.Registry
 	webhooks *webhook.Manager // optional; nil disables webhook dispatch
+	history  *historyWriter   // async persister; nil disables history
 	name     string
 	version  string
 	log      *slog.Logger
@@ -94,6 +95,7 @@ func New(cfg Config) (*Server, error) {
 		tenants:  tenants.New(cfg.Store),
 		channels: channels.NewRegistry(),
 		webhooks: cfg.WebhookMgr,
+		history:  newHistoryWriter(cfg.Store),
 		name:     cfg.Name,
 		version:  cfg.Version,
 		log:      log,
@@ -103,7 +105,23 @@ func New(cfg Config) (*Server, error) {
 // Serve listens on the configured address and accepts connections until
 // ctx is cancelled or Listen fails. Each accepted connection runs its own
 // goroutines and is independent.
+//
+// Serve also spins up the async history writer goroutine and tears it
+// down before returning.
 func (s *Server) Serve(ctx context.Context) error {
+	// History writer runs for the lifetime of Serve.
+	if s.history != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.history.run(ctx)
+		}()
+		defer s.history.Close()
+	}
+	return s.serveAcceptLoop(ctx)
+}
+
+func (s *Server) serveAcceptLoop(ctx context.Context) error {
 	l, err := tls.Listen("tcp", s.addr, s.tlsCfg)
 	if err != nil {
 		return fmt.Errorf("server: listen %s: %w", s.addr, err)

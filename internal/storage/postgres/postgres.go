@@ -130,3 +130,10 @@ func (*Store) UpdateIntegration(context.Context, uuid.UUID, *storage.Integration
 func (*Store) DeleteIntegration(context.Context, uuid.UUID, uuid.UUID) error {
 	return ErrNotImplemented
 }
+func (*Store) RecordMessage(context.Context, *storage.StoredMessage) error { return ErrNotImplemented }
+func (*Store) ListMessages(context.Context, uuid.UUID, uuid.UUID, int, time.Time) ([]*storage.StoredMessage, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) PurgeMessagesOlderThan(context.Context, time.Duration) (int, error) {
+	return 0, ErrNotImplemented
+}

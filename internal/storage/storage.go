@@ -115,6 +115,21 @@ type ChannelACLEntry struct {
 	GrantedBy uuid.UUID // account who issued the grant; zero for owner self-grant on create
 }
 
+// StoredMessage is a persisted chat message. Recorded after fan-out
+// (off the hot path) so message history survives server restart for
+// retention-window minutes/days. NOT used during broadcast; the live
+// channel ring buffer (channels.Channel.RecentMessages) is the
+// authoritative recent-history source for webhook context-attach.
+type StoredMessage struct {
+	ID            uuid.UUID
+	TenantID      uuid.UUID
+	ChannelID     uuid.UUID
+	FromAccountID uuid.UUID
+	Body          string
+	TS            time.Time
+	CreatedAt     time.Time
+}
+
 // Subscription is a webhook subscription owned by a bot account. The
 // match rules and budget are stored as JSON; the package matcher
 // (internal/matcher) compiles them.
@@ -256,4 +271,11 @@ type Store interface {
 	ListIntegrationsByTenant(ctx context.Context, tenantID uuid.UUID) ([]*Integration, error)
 	UpdateIntegration(ctx context.Context, tenantID uuid.UUID, integ *Integration) error
 	DeleteIntegration(ctx context.Context, tenantID, id uuid.UUID) error
+
+	// Stored chat messages (durable history).
+	// Recorded off the hot path; reads serve the chathistory verb +
+	// REST endpoint + TUI reconnect backfill.
+	RecordMessage(ctx context.Context, msg *StoredMessage) error
+	ListMessages(ctx context.Context, tenantID, channelID uuid.UUID, limit int, beforeTS time.Time) ([]*StoredMessage, error)
+	PurgeMessagesOlderThan(ctx context.Context, retention time.Duration) (int, error)
 }
