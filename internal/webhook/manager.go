@@ -36,6 +36,11 @@ type Manager struct {
 	// applied at request time via context. Reused across requests.
 	httpClient *http.Client
 
+	// transports is the registry of delivery transports keyed by URL
+	// scheme. HTTP is always registered; AMQP and MQTT are registered
+	// when their respective transports are available.
+	transports *registry
+
 	mu  sync.RWMutex
 	// subs maps subscription_id -> live cached entry. Built from storage
 	// at startup via Reload; mutated by Manager.OnSubscriptionChanged when
@@ -125,7 +130,11 @@ func NewManager(store storage.Store, cfg Config, logger *slog.Logger) *Manager {
 		httpClient: &http.Client{
 			Timeout: cfg.HTTPTimeout,
 		},
+		transports: newRegistry(),
 	}
+	m.transports.register(newHTTPTransport(m.httpClient))
+	m.transports.register(newAMQPTransport())
+	m.transports.register(newMQTTTransport())
 	m.pool = newWorkerPool(cfg, m)
 	return m
 }
@@ -236,9 +245,15 @@ func (m *Manager) Start(ctx context.Context) {
 }
 
 // Stop drains the worker pool. Waits for in-flight tasks to complete (or
-// the parent ctx to cancel, whichever comes first).
+// the parent ctx to cancel, whichever comes first). Also tears down any
+// pooled broker connections held by AMQP / MQTT transports.
 func (m *Manager) Stop() {
 	m.pool.Stop()
+	if m.transports != nil {
+		if err := m.transports.closeAll(); err != nil {
+			m.log.Warn("transport close", "err", err)
+		}
+	}
 }
 
 // Notify is the hot-path entry point. Called once per channel broadcast

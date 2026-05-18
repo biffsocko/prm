@@ -57,8 +57,8 @@ func Create(ctx context.Context, st storage.Store, mgr *webhook.Manager, tenant 
 	if bot.Type != storage.AccountBot {
 		return nil, fmt.Errorf("%w: subscriptions are owned by bot accounts only", ErrBadRequest)
 	}
-	if in.URL == "" {
-		return nil, fmt.Errorf("%w: url is required", ErrBadRequest)
+	if err := webhook.ValidateURL(in.URL); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBadRequest, err)
 	}
 	if len(in.Match) == 0 {
 		return nil, fmt.Errorf("%w: match rules are required", ErrBadRequest)
@@ -159,6 +159,9 @@ func Update(ctx context.Context, st storage.Store, mgr *webhook.Manager, tenant 
 		return nil, err
 	}
 	if in.URL != nil {
+		if err := webhook.ValidateURL(*in.URL); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrBadRequest, err)
+		}
 		sub.URL = *in.URL
 	}
 	if in.Match != nil {

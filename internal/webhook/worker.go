@@ -1,12 +1,9 @@
 package webhook
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -101,10 +98,18 @@ func (p *workerPool) run(ctx context.Context) {
 	}
 }
 
-// deliver performs the HMAC-signed POST with retry policy:
-//   - 2xx -> record OK fire, done
-//   - 5xx / timeout / network error -> exponential backoff, up to MaxRetries
-//   - 4xx -> drop without retry; increment consec4xx; auto-disable at threshold
+// deliver performs the HMAC-signed publish via the transport selected
+// by the subscription URL's scheme. Retry semantics are shared across
+// transports:
+//   - DeliveryOK        -> record + stop retrying
+//   - DeliveryTransient -> exponential backoff, up to MaxRetries
+//   - DeliveryPermanent -> drop without retry; bump consec4xx;
+//                          auto-disable at the configured threshold.
+//
+// "consec4xx" is a historical name carried forward from the HTTP-only
+// era; it now counts permanent failures from any transport
+// (HTTP 4xx, AMQP "no route", MQTT auth refused, etc.) -- same
+// behavior, more transports.
 func (p *workerPool) deliver(ctx context.Context, task *fireTask) {
 	s := task.sub
 	payload := &Payload{
@@ -125,73 +130,61 @@ func (p *workerPool) deliver(ctx context.Context, task *fireTask) {
 		return
 	}
 
-	var lastErr error
+	scheme := schemeOf(s.URL)
+	tr, ok := p.mgr.transports.for_(scheme)
+	if !ok {
+		p.mgr.log.Error("no transport for subscription scheme",
+			"subscription_id", s.ID, "scheme", scheme)
+		p.recordFire(s, "failed", 0, fmt.Sprintf("no transport for scheme %q", scheme))
+		return
+	}
+	target := Target{URL: s.URL, SubscriptionID: s.ID.String()}
+
+	var lastDetail string
 	for attempt := 1; attempt <= p.cfg.MaxRetries; attempt++ {
-		statusCode, err := p.postOnce(ctx, s, body)
-		if err == nil && statusCode >= 200 && statusCode < 300 {
+		sig := Sign(body, s.Secret, time.Now().Unix())
+		res := tr.Send(ctx, target, body, sig)
+		switch res.Kind {
+		case DeliveryOK:
 			s.mu.Lock()
 			s.consec4xx = 0
 			s.mu.Unlock()
-			p.recordFire(s, "ok", attempt, "")
+			p.recordFire(s, "ok", attempt, res.StatusDetail)
 			return
-		}
-		// 4xx: don't retry. Bump consec4xx; auto-disable at threshold.
-		if err == nil && statusCode >= 400 && statusCode < 500 {
+		case DeliveryPermanent:
 			s.mu.Lock()
 			s.consec4xx++
 			disable := s.consec4xx >= p.cfg.AutoDisable4xx
 			s.mu.Unlock()
-			p.recordFire(s, "dropped_4xx", attempt, fmt.Sprintf("HTTP %d", statusCode))
+			detail := res.StatusDetail
+			if res.Err != nil {
+				detail = fmt.Sprintf("%s: %v", detail, res.Err)
+			}
+			p.recordFire(s, "dropped_4xx", attempt, detail)
 			if disable {
-				p.autoDisable(s, fmt.Sprintf("%d consecutive 4xx responses", p.cfg.AutoDisable4xx))
+				p.autoDisable(s, fmt.Sprintf("%d consecutive permanent failures", p.cfg.AutoDisable4xx))
 			}
 			return
-		}
-		// 5xx / network / timeout: retry with backoff.
-		if err != nil {
-			lastErr = err
-		} else {
-			lastErr = fmt.Errorf("HTTP %d", statusCode)
-		}
-		if attempt < p.cfg.MaxRetries {
-			delay := time.Duration(1<<uint(attempt-1)) * 250 * time.Millisecond // 250ms, 500ms, 1s, ...
-			if delay > 5*time.Second {
-				delay = 5 * time.Second
+		case DeliveryTransient:
+			lastDetail = res.StatusDetail
+			if res.Err != nil {
+				lastDetail = fmt.Sprintf("%s: %v", lastDetail, res.Err)
 			}
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done():
-				p.recordFire(s, "failed", attempt, "shutdown")
-				return
+			if attempt < p.cfg.MaxRetries {
+				delay := time.Duration(1<<uint(attempt-1)) * 250 * time.Millisecond
+				if delay > 5*time.Second {
+					delay = 5 * time.Second
+				}
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					p.recordFire(s, "failed", attempt, "shutdown")
+					return
+				}
 			}
 		}
 	}
-	p.recordFire(s, "failed", p.cfg.MaxRetries,
-		fmt.Sprintf("last error: %v", lastErr))
-}
-
-// postOnce performs a single HTTP attempt; returns (statusCode, transportError).
-// transportError is non-nil only when the request couldn't reach the server
-// or timed out -- HTTP responses (even 5xx) come back as nil error +
-// statusCode for the caller's retry logic to decide.
-func (p *workerPool) postOnce(ctx context.Context, s *Subscription, body []byte) (int, error) {
-	sig := Sign(body, s.Secret, time.Now().Unix())
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL, bytes.NewReader(body))
-	if err != nil {
-		return 0, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("PRM-Signature", sig.Header())
-	req.Header.Set("User-Agent", "prmd-webhook/0.1")
-
-	resp, err := p.mgr.httpClient.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	// Read+discard so the connection can be reused.
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode, nil
+	p.recordFire(s, "failed", p.cfg.MaxRetries, "last error: "+lastDetail)
 }
 
 func (p *workerPool) recordFire(s *Subscription, status string, attempts int, lastErr string) {

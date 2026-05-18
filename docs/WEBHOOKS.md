@@ -221,6 +221,137 @@ def verify(header: str, body: bytes, secret: bytes, max_age_s: int = 300) -> boo
 
 **Why 4xx auto-disable:** a 4xx says "this request will never succeed as-is" — usually a malformed bot endpoint or a permissions misconfiguration. Continuing to send is just generating noise.
 
+The same three-class outcome (`OK` / transient / permanent) applies to the alternate transports below — see "Transports" for the per-transport mapping. The auto-disable threshold counts permanent failures from any transport.
+
+---
+
+## Transports — HTTP, AMQP, MQTT
+
+A subscription's URL scheme picks the delivery transport. Same signed payload, same matcher, same debounce / cooldown / budget — just different bytes-on-wire.
+
+| Scheme | What it does | When to choose it |
+|---|---|---|
+| `https` / `http` | POST the signed JSON payload; HMAC in the `PRM-Signature` header. (Default.) | Default for serverless bots (Lambda, Cloud Run, Workers). One signed POST per fire. `http://` allowed for localhost dev only. |
+| `amqp` / `amqps` | Publish the signed JSON to an AMQP 0.9.1 exchange + routing key. HMAC in the `prm-signature` AMQP message header. Publisher confirms enabled. | You already run RabbitMQ as your service bus. Many consumers can compete on a single queue (work-sharing) or fan out via topic exchanges. |
+| `mqtt` / `mqtts` | Publish a JSON envelope to an MQTT topic. HMAC carried in the envelope (see "MQTT envelope" below). QoS 1 by default. | IoT / edge / telemetry shapes. You already run a Mosquitto / EMQX / HiveMQ broker. Many cheap subscribers wanting at-least-once delivery. |
+
+### AMQP URL shape
+
+```
+amqp://user:pass@host:5672/vhost?exchange=alerts&routing_key=ops.deploy[&persistent=true&mandatory=false]
+amqps://...                                          (TLS)
+```
+
+| Query param | Default | Notes |
+|---|---|---|
+| `exchange` | `""` (default exchange) | Empty means publish directly to the queue named in `routing_key`. |
+| `routing_key` | **required** | Routing key on the exchange; queue name when using the default exchange. |
+| `persistent` | `true` | Messages set `DeliveryMode=2` (broker persists to disk). Set `false` for transient. |
+| `mandatory` | `false` | If `true`, broker returns the message when no queue is bound. Returned messages count as transient failures. |
+
+Outcome mapping:
+
+| Result | Maps to |
+|---|---|
+| `basic.publish` succeeds + publisher confirm `ack` | `OK` |
+| publisher confirm `nack` (broker rejected, memory pressure, etc.) | transient |
+| broker disconnect, channel reset, dial failure | transient |
+| URL parse error / missing routing_key | permanent |
+
+Sample consumer (Python with `pika`):
+
+```python
+import os, hmac, hashlib, json, pika
+
+SECRET = os.environ["PRM_SECRET"].encode()
+
+def verify(body, signature):
+    t, v1 = (kv.split("=", 1) for kv in signature.split(","))[0:2]
+    mac = hmac.new(SECRET, f"{t[1]}.{body.decode()}".encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(mac, v1[1])
+
+def on_message(ch, method, props, body):
+    sig = props.headers.get("prm-signature", "")
+    if not verify(body, sig):
+        ch.basic_nack(method.delivery_tag, requeue=False)  # signature mismatch -> dead-letter
+        return
+    payload = json.loads(body)
+    # ... your bot logic ...
+    ch.basic_ack(method.delivery_tag)
+
+conn = pika.BlockingConnection(pika.URLParameters("amqp://user:pw@rmq/%2f"))
+ch = conn.channel()
+ch.queue_declare(queue="ops.deploy", durable=True)
+ch.basic_consume("ops.deploy", on_message)
+ch.start_consuming()
+```
+
+### MQTT URL shape
+
+```
+mqtt://user:pass@broker:1883/topic/path[?qos=1&retain=false&client_id=mybot]
+mqtts://...                                          (TLS, default port 8883)
+```
+
+| Query param | Default | Notes |
+|---|---|---|
+| `qos` | `1` | 0 (fire-and-forget), 1 (at-least-once), 2 (exactly-once). PRM requires PUBACK for 1/2 to count as `OK`. |
+| `retain` | `false` | Set the MQTT retain flag on the published message. |
+| `client_id` | `prmd-<short-sub-id>` | Override when your broker rejects duplicate client ids across PRM nodes. |
+
+**MQTT envelope.** MQTT 3.1.1 has no per-message headers, so PRM wraps the signed payload in a JSON envelope:
+
+```json
+{
+  "prm_signature":       "t=1700000000,v1=<hex>",
+  "prm_subscription_id": "9f1c-...",
+  "payload_b64":         "<base64 of the exact JSON bytes HTTP would have POSTed>"
+}
+```
+
+To verify in a bot: parse the envelope, base64-decode `payload_b64` into `body`, then HMAC-SHA256 `<ts>.<body>` with the subscription's secret and compare against the `v1=` portion of `prm_signature`. Same algorithm as the HTTP `PRM-Signature` header — just transported via the body because MQTT 3 has nowhere else to put it.
+
+Outcome mapping:
+
+| Result | Maps to |
+|---|---|
+| Publish + PUBACK received (qos 1/2) | `OK` |
+| QoS 0 publish accepted by client library | `OK` (no ack possible at QoS 0) |
+| Broker disconnect, connect timeout, publish timeout | transient |
+| URL parse error / invalid qos / missing topic | permanent |
+
+Sample consumer (Python with `paho.mqtt`):
+
+```python
+import os, hmac, hashlib, base64, json, paho.mqtt.client as mqtt
+
+SECRET = os.environ["PRM_SECRET"].encode()
+
+def on_message(client, _, msg):
+    env = json.loads(msg.payload)
+    body = base64.b64decode(env["payload_b64"])
+    sig  = env["prm_signature"]              # "t=...,v1=..."
+    parts = dict(p.split("=", 1) for p in sig.split(","))
+    mac = hmac.new(SECRET, f"{parts['t']}.{body.decode()}".encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(mac, parts["v1"]):
+        return                                # silent drop on bad signature
+    payload = json.loads(body)
+    # ... your bot logic ...
+
+c = mqtt.Client(client_id="my-triage-bot")
+c.username_pw_set("user", "pw")
+c.on_message = on_message
+c.connect("broker", 1883)
+c.subscribe("alerts/ops/+", qos=1)
+c.loop_forever()
+```
+
+### Choosing a transport
+
+- **Use HTTP** when you want serverless bots, when each fire is independent, and when you don't already run a broker. This is the right default.
+- **Use AMQP** when you want competing consumers (work-sharing across N replicas of a bot), broker-side routing (exchanges + bindings), or you've already standardized on RabbitMQ as your service bus.
+- **Use MQTT** when consumers are cheap and many (edge, IoT, plus "I want every consumer to see every event" via QoS 1 on the same topic), or when you've already standardized on an MQTT broker.
+
 To re-enable a disabled subscription:
 
 ```bash

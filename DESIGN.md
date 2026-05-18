@@ -191,10 +191,24 @@ When a frame on the channel matches `any_of`:
 2. **Debounce buffer.** Hold the match for `debounce_ms`. If additional matching messages arrive in the window, batch them all into one fire.
 3. **Budget check.** If `daily_max_fires` for this subscription has been reached, suppress the fire and emit a single `budget_exhausted` event (per day) so the bot owner knows.
 4. **Context attach.** Pull the last `context_lines` channel messages from in-memory state and bundle them into the payload.
-5. **Sign and POST.** Payload is signed with HMAC-SHA256 using the subscription's secret. Header: `PRM-Signature: t=<unix>,v1=<hex>`.
-6. **Retry policy.** On 5xx or timeout: exponential backoff, up to 3 retries, then give up and record the failure. On 4xx: do not retry; flag the subscription as broken after N consecutive 4xx and auto-disable.
+5. **Sign and deliver.** Payload is signed with HMAC-SHA256 using the subscription's secret. The delivery transport is selected by the subscription's URL scheme — see "Delivery transports" below.
+6. **Retry policy.** On transient failure (5xx, network, broker disconnect, AMQP nack, MQTT timeout): exponential backoff, up to 3 retries, then give up and record the failure. On permanent failure (4xx, malformed URL, auth refused): do not retry; flag the subscription after N consecutive permanent failures and auto-disable.
 
 Webhook delivery runs on a separate worker pool. **It never blocks the realtime fan-out path.**
+
+### Delivery transports
+
+The subscription URL's scheme picks the transport. Same payload, same matcher, same debounce/cooldown/budget — only the bytes-on-wire differ.
+
+| Scheme | Transport | HMAC carriage |
+|---|---|---|
+| `https`, `http` | HTTP POST, JSON body | `PRM-Signature: t=<unix>,v1=<hex>` header (the canonical form) |
+| `amqp`, `amqps` | RabbitMQ-style publish on AMQP 0.9.1 with publisher confirms enabled; exchange + routing_key in URL query | `prm-signature` AMQP message header |
+| `mqtt`, `mqtts` | MQTT 3.1.1 publish, QoS 1 default; pooled client per (broker, user, client-id) | Embedded in a JSON envelope `{prm_signature, prm_subscription_id, payload_b64}` because MQTT 3 has no per-message headers; bots base64-decode `payload_b64` to recover the exact bytes the HTTP transport would have POSTed, then verify the signature against those bytes |
+
+Transports register themselves with the manager at NewManager(); URL validation at subscription-create time rejects schemes without a registered transport. Connection pooling is per-transport: HTTP via the shared `http.Client`, AMQP one Connection + Channel per (host, user, vhost) with publisher confirms, MQTT one paho client per (broker, user, client-id) with auto-reconnect. All pooled connections are torn down by `Manager.Stop`.
+
+Choosing a transport is operational, not architectural: HTTP for serverless / one-shot bots and the simplest deployment, AMQP when you already run RabbitMQ and want competing consumers + broker-side routing, MQTT for edge / IoT / many-cheap-consumers. See [docs/WEBHOOKS.md](docs/WEBHOOKS.md#transports--http-amqp-mqtt) for URL shapes, per-transport outcome mappings, and Python consumer examples for each.
 
 ## Inbound integrations
 

@@ -2,7 +2,7 @@
 
 A high-speed, auth-required chat relay built for LLM-powered bots as first-class citizens. Similar shape to IRC — server, channels, identities, private messages — but a fresh wire protocol and modern primitives throughout.
 
-**Status:** **v1.0.0** — slices 1 through 5 implemented. Real TLS server, password + token auth, multi-tenant from day one, explicit channels with ACL enforcement, bot accounts with API tokens, TUI client with reconnect, hot-standby HA pattern with operator runbook, webhook subscriptions with server-side filter pushdown / debounce / cooldown / budget caps / HMAC signing / context-attach (manageable via REST **or** native PRM-protocol verbs), **inbound integrations** (Splunk / Graylog / generic-JSON / **Datadog** / **GitHub** adapters that consume external events and republish them onto a chat channel where the same subscription machinery drives bots), first-class **@-mention rule** (no regex hack), durable **chat history** (async writer + `chathistory` retrieval verb), and a **ghost-member indicator** so webhook-only bots show up in `members` listings. End-to-end tests cover every direction. Sub-ms p50 fan-out preserved. See [DESIGN.md](DESIGN.md#implementation-slices) for the slice plan.
+**Status:** **v1.0.0** — slices 1 through 5 implemented. Real TLS server, password + token auth, multi-tenant from day one, explicit channels with ACL enforcement, bot accounts with API tokens, TUI client with reconnect, hot-standby HA pattern with operator runbook, webhook subscriptions with server-side filter pushdown / debounce / cooldown / budget caps / HMAC signing / context-attach (manageable via REST **or** native PRM-protocol verbs), **pluggable delivery transports** (HTTP / AMQP / MQTT — URL scheme picks), **inbound integrations** (Splunk / Graylog / generic-JSON / **Datadog** / **GitHub** adapters that consume external events and republish them onto a chat channel where the same subscription machinery drives bots), first-class **@-mention rule** (no regex hack), durable **chat history** (async writer + `chathistory` retrieval verb), and a **ghost-member indicator** so webhook-only bots show up in `members` listings. End-to-end tests cover every direction. Sub-ms p50 fan-out preserved. See [DESIGN.md](DESIGN.md#implementation-slices) for the slice plan.
 
 ## Try it locally
 
@@ -94,7 +94,7 @@ sequenceDiagram
     Bot->>S: post triage response back into channel
 ```
 
-For the bot-author guide (creating subscriptions, verifying signatures, payload shape, retry policy, a complete minimal Python bot), see [docs/WEBHOOKS.md](docs/WEBHOOKS.md).
+For the bot-author guide (creating subscriptions, verifying signatures, payload shape, retry policy, a complete minimal Python bot), see [docs/WEBHOOKS.md](docs/WEBHOOKS.md). PRM ships with three delivery transports — the subscription URL scheme picks: `https://` (default, signed POST), `amqp://` / `amqps://` (RabbitMQ-style publish with publisher confirms), or `mqtt://` / `mqtts://` (MQTT 3.1.1 publish with QoS 1 by default). Same payload, same matcher, same debounce/cooldown/budget — different bytes-on-wire. Pick whatever your bot infra already speaks.
 
 Bots can manage subscriptions via either surface — same business logic underneath (`internal/subops`):
 
