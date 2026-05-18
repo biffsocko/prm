@@ -28,6 +28,7 @@ import (
 	"github.com/biffsocko/prm/internal/channels"
 	"github.com/biffsocko/prm/internal/storage"
 	"github.com/biffsocko/prm/internal/tenants"
+	"github.com/biffsocko/prm/internal/webhook"
 )
 
 // Config is what a caller passes to New.
@@ -43,18 +44,23 @@ type Config struct {
 	// Name and Version surfaced in Welcome frames.
 	Name    string
 	Version string
+	// WebhookMgr, if set, is notified after every channel msg broadcast
+	// so matching subscriptions can fire. Optional; nil disables webhook
+	// dispatch.
+	WebhookMgr *webhook.Manager
 }
 
 // Server is the PRM realtime server.
 type Server struct {
-	addr      string
-	tlsCfg    *tls.Config
-	store     storage.Store
-	tenants   *tenants.Service
-	channels  *channels.Registry
-	name      string
-	version   string
-	log       *slog.Logger
+	addr     string
+	tlsCfg   *tls.Config
+	store    storage.Store
+	tenants  *tenants.Service
+	channels *channels.Registry
+	webhooks *webhook.Manager // optional; nil disables webhook dispatch
+	name     string
+	version  string
+	log      *slog.Logger
 
 	listener net.Listener
 	wg       sync.WaitGroup
@@ -87,6 +93,7 @@ func New(cfg Config) (*Server, error) {
 		store:    cfg.Store,
 		tenants:  tenants.New(cfg.Store),
 		channels: channels.NewRegistry(),
+		webhooks: cfg.WebhookMgr,
 		name:     cfg.Name,
 		version:  cfg.Version,
 		log:      log,

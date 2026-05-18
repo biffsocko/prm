@@ -32,9 +32,11 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/biffsocko/prm/internal/auth"
+	"github.com/biffsocko/prm/internal/rest"
 	"github.com/biffsocko/prm/internal/server"
 	"github.com/biffsocko/prm/internal/storage"
 	"github.com/biffsocko/prm/internal/storage/open"
+	"github.com/biffsocko/prm/internal/webhook"
 )
 
 const version = "0.1.0-slice1"
@@ -112,7 +114,8 @@ Run any subcommand with -h to see its flags.
 
 func cmdServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	addr := fs.String("addr", ":6697", "TCP address to listen on")
+	addr := fs.String("addr", ":6697", "realtime TCP address to listen on")
+	restAddr := fs.String("rest-addr", ":8443", "REST control plane TCP address (empty to disable)")
 	storageURL := fs.String("storage", "sqlite:./prm.db", "storage backend URL")
 	dev := fs.Bool("dev", false, "use a self-signed certificate for localhost (DEV ONLY)")
 	certFile := fs.String("cert", "", "path to TLS certificate (PEM)")
@@ -133,21 +136,56 @@ func cmdServe(args []string) int {
 		return 1
 	}
 
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	// Webhook manager: cache all active subscriptions across all tenants.
+	mgr := webhook.NewManager(st, webhook.Config{}, log)
+	tens, err := st.ListTenants(ctx)
+	if err != nil {
+		log.Error("list tenants", "err", err)
+		return 1
+	}
+	if err := mgr.Reload(ctx, tens); err != nil {
+		log.Error("webhook reload", "err", err)
+		return 1
+	}
+	mgr.Start(ctx)
+	defer mgr.Stop()
+
 	srv, err := server.New(server.Config{
-		Addr:      *addr,
-		TLSConfig: tlsCfg,
-		Store:     st,
-		Logger:    log,
-		Name:      "prmd",
-		Version:   version,
+		Addr:       *addr,
+		TLSConfig:  tlsCfg,
+		Store:      st,
+		Logger:     log,
+		Name:       "prmd",
+		Version:    version,
+		WebhookMgr: mgr,
 	})
 	if err != nil {
 		log.Error("server new", "err", err)
 		return 1
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	// REST control plane on a separate listener (optional).
+	if *restAddr != "" {
+		restSrv, err := rest.New(rest.Config{
+			Addr:       *restAddr,
+			TLSConfig:  tlsCfg,
+			Store:      st,
+			Logger:     log,
+			WebhookMgr: mgr,
+		})
+		if err != nil {
+			log.Error("rest new", "err", err)
+			return 1
+		}
+		go func() {
+			if err := restSrv.Serve(ctx); err != nil {
+				log.Error("rest serve", "err", err)
+			}
+		}()
+	}
 
 	if err := srv.Serve(ctx); err != nil {
 		log.Error("serve", "err", err)

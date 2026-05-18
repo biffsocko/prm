@@ -19,6 +19,7 @@ import (
 	"github.com/biffsocko/prm/internal/auth"
 	"github.com/biffsocko/prm/internal/channels"
 	"github.com/biffsocko/prm/internal/proto"
+	"github.com/biffsocko/prm/internal/webhook"
 )
 
 // silence unused-import lint when channels.Member is only referenced via
@@ -511,10 +512,11 @@ func (c *Conn) handleMsg(ctx context.Context, m proto.Msg) {
 		return
 	}
 	// Server-stamp From + TS, encode the broadcast frame once, fan out.
+	now := time.Now().UTC()
 	out := proto.Msg{
 		Channel: m.Channel,
 		From:    c.accountID.String(),
-		TS:      time.Now().UTC(),
+		TS:      now,
 		Body:    m.Body,
 	}
 	bytes, err := proto.EncodeBytes(out)
@@ -523,7 +525,48 @@ func (c *Conn) handleMsg(ctx context.Context, m proto.Msg) {
 		c.sendError("internal", "", m.ID)
 		return
 	}
+
+	// Webhook notify: snapshot the channel's CURRENT recent-history
+	// BEFORE appending this message, so the snapshot becomes "context
+	// preceding the matching message" for any fire. Snapshot is generous
+	// (up to the ring's depth) so subscriptions with different
+	// ContextLines settings all draw from the same data.
+	var hist []channels.HistoryEntry
+	if c.srv.webhooks != nil {
+		hist = ch.RecentMessages(32)
+	}
+
+	// Broadcast first (the hot path; users get the message ASAP).
 	ch.Broadcast(bytes)
+
+	// Append to history so the NEXT msg's webhook snapshot will include
+	// this one. After broadcast (we already have the encoded bytes).
+	ch.AppendHistory(channels.HistoryEntry{
+		From:        c.accountID,
+		DisplayName: c.displayName,
+		TS:          now,
+		Body:        m.Body,
+	})
+
+	// Notify the webhook manager off the hot path. The manager's
+	// Notify is non-blocking (matches push onto an internal worker
+	// pool); cheap to call inline.
+	if c.srv.webhooks != nil {
+		c.srv.webhooks.Notify(webhook.Event{
+			TenantID:    c.tenantID,
+			ChannelID:   chanID,
+			ChannelName: m.Channel,
+			From:        c.accountID,
+			DisplayName: c.displayName,
+			Body:        m.Body,
+			TS:          now,
+			// Mentions: slice 3 has no mention parser yet; bots can use
+			// regex-with-account-id workaround. Slice 5+ will add a
+			// proper parser.
+			Mentions: nil,
+			Context:  hist,
+		})
+	}
 }
 
 // --- send helpers ---
