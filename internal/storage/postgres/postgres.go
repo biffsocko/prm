@@ -12,6 +12,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -87,3 +88,27 @@ func (*Store) ListTokens(context.Context, uuid.UUID, uuid.UUID) ([]*storage.Toke
 }
 func (*Store) RevokeToken(context.Context, uuid.UUID, uuid.UUID) error { return ErrNotImplemented }
 func (*Store) TouchTokenLastUsed(context.Context, uuid.UUID) error      { return ErrNotImplemented }
+func (*Store) CreateSubscription(context.Context, uuid.UUID, *storage.Subscription) error {
+	return ErrNotImplemented
+}
+func (*Store) GetSubscriptionByID(context.Context, uuid.UUID, uuid.UUID) (*storage.Subscription, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) ListSubscriptionsByAccount(context.Context, uuid.UUID, uuid.UUID) ([]*storage.Subscription, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) ListSubscriptionsByChannel(context.Context, uuid.UUID, uuid.UUID) ([]*storage.Subscription, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) UpdateSubscription(context.Context, uuid.UUID, *storage.Subscription) error {
+	return ErrNotImplemented
+}
+func (*Store) DeleteSubscription(context.Context, uuid.UUID, uuid.UUID) error {
+	return ErrNotImplemented
+}
+func (*Store) RecordSubscriptionFire(context.Context, *storage.SubscriptionFire) error {
+	return ErrNotImplemented
+}
+func (*Store) CountSubscriptionFiresSince(context.Context, uuid.UUID, uuid.UUID, time.Time) (int, error) {
+	return 0, ErrNotImplemented
+}

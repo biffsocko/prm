@@ -115,6 +115,39 @@ type ChannelACLEntry struct {
 	GrantedBy uuid.UUID // account who issued the grant; zero for owner self-grant on create
 }
 
+// Subscription is a webhook subscription owned by a bot account. The
+// match rules and budget are stored as JSON; the package matcher
+// (internal/matcher) compiles them.
+type Subscription struct {
+	ID           uuid.UUID
+	TenantID     uuid.UUID
+	AccountID    uuid.UUID // owner (a bot account)
+	ChannelID    uuid.UUID
+	URL          string
+	SecretHash   []byte   // SHA-256 of the plaintext HMAC secret; plaintext shown once
+	MatchJSON    []byte   // serialized match rules; opaque to storage
+	Events       []string // e.g. ["message"]
+	ContextLines int
+	DebounceMs   int
+	CooldownMs   int
+	BudgetJSON   []byte // serialized Budget; opaque to storage
+	DisabledAt   time.Time
+	CreatedAt    time.Time
+}
+
+// SubscriptionFire is one webhook attempt — for budget accounting and
+// failure auditing. One row per fire (not per attempt) — Attempts counts
+// retries.
+type SubscriptionFire struct {
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	SubscriptionID uuid.UUID
+	FiredAt        time.Time
+	Status         string // "ok" | "retrying" | "failed" | "dropped_4xx" | "budget_exhausted"
+	Attempts       int
+	LastError      string
+}
+
 // Token is an API token issued to a bot account. The plaintext token is
 // shown to the user exactly once at issuance; only the SHA-256 hash is
 // stored. Lookup is by hash (the server hashes the bearer token on auth
@@ -171,4 +204,16 @@ type Store interface {
 	ListTokens(ctx context.Context, tenantID, accountID uuid.UUID) ([]*Token, error)
 	RevokeToken(ctx context.Context, tenantID, tokenID uuid.UUID) error
 	TouchTokenLastUsed(ctx context.Context, tokenID uuid.UUID) error
+
+	// Subscriptions (webhook subscriptions)
+	CreateSubscription(ctx context.Context, tenantID uuid.UUID, sub *Subscription) error
+	GetSubscriptionByID(ctx context.Context, tenantID, id uuid.UUID) (*Subscription, error)
+	ListSubscriptionsByAccount(ctx context.Context, tenantID, accountID uuid.UUID) ([]*Subscription, error)
+	ListSubscriptionsByChannel(ctx context.Context, tenantID, channelID uuid.UUID) ([]*Subscription, error)
+	UpdateSubscription(ctx context.Context, tenantID uuid.UUID, sub *Subscription) error
+	DeleteSubscription(ctx context.Context, tenantID, id uuid.UUID) error
+
+	// Subscription fires (for budget accounting + audit)
+	RecordSubscriptionFire(ctx context.Context, fire *SubscriptionFire) error
+	CountSubscriptionFiresSince(ctx context.Context, tenantID, subID uuid.UUID, since time.Time) (int, error)
 }

@@ -122,6 +122,36 @@ var migrations = []string{
 	) STRICT`,
 	`CREATE INDEX IF NOT EXISTS tokens_hash_idx ON tokens(hash)`,
 	`CREATE INDEX IF NOT EXISTS tokens_account_idx ON tokens(tenant_id, account_id)`,
+	`CREATE TABLE IF NOT EXISTS subscriptions (
+		id            TEXT PRIMARY KEY,
+		tenant_id     TEXT NOT NULL,
+		account_id    TEXT NOT NULL,
+		channel_id    TEXT NOT NULL,
+		url           TEXT NOT NULL,
+		secret_hash   BLOB NOT NULL,
+		match_json    BLOB NOT NULL,
+		events_json   TEXT NOT NULL DEFAULT '["message"]',
+		context_lines INTEGER NOT NULL DEFAULT 0,
+		debounce_ms   INTEGER NOT NULL DEFAULT 0,
+		cooldown_ms   INTEGER NOT NULL DEFAULT 0,
+		budget_json   BLOB NOT NULL DEFAULT '{}',
+		disabled_at   INTEGER NOT NULL DEFAULT 0,
+		created_at    INTEGER NOT NULL,
+		FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+	) STRICT`,
+	`CREATE INDEX IF NOT EXISTS subscriptions_tenant_channel_idx ON subscriptions(tenant_id, channel_id) WHERE disabled_at = 0`,
+	`CREATE INDEX IF NOT EXISTS subscriptions_tenant_account_idx ON subscriptions(tenant_id, account_id)`,
+	`CREATE TABLE IF NOT EXISTS subscription_fires (
+		id              TEXT PRIMARY KEY,
+		tenant_id       TEXT NOT NULL,
+		subscription_id TEXT NOT NULL,
+		fired_at        INTEGER NOT NULL,
+		status          TEXT NOT NULL,
+		attempts        INTEGER NOT NULL DEFAULT 0,
+		last_error      TEXT NOT NULL DEFAULT '',
+		FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+	) STRICT`,
+	`CREATE INDEX IF NOT EXISTS subscription_fires_subid_fired_idx ON subscription_fires(tenant_id, subscription_id, fired_at)`,
 }
 
 // CreateTenant inserts a new tenant. If t.ID is zero, a UUID v7 is generated.
@@ -476,6 +506,209 @@ func (s *Store) TouchTokenLastUsed(ctx context.Context, tokenID uuid.UUID) error
 		return fmt.Errorf("sqlite touch token: %w", err)
 	}
 	return nil
+}
+
+// --- subscriptions ---
+
+func (s *Store) CreateSubscription(ctx context.Context, tenantID uuid.UUID, sub *storage.Subscription) error {
+	if tenantID == uuid.Nil {
+		return fmt.Errorf("%w: tenantID required", storage.ErrInvalid)
+	}
+	if sub.TenantID != uuid.Nil && sub.TenantID != tenantID {
+		return fmt.Errorf("%w: subscription.TenantID does not match argument tenantID", storage.ErrInvalid)
+	}
+	sub.TenantID = tenantID
+	if sub.ID == uuid.Nil {
+		var err error
+		sub.ID, err = uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("sqlite: generate subscription id: %w", err)
+		}
+	}
+	if sub.CreatedAt.IsZero() {
+		sub.CreatedAt = time.Now().UTC()
+	}
+	if sub.URL == "" {
+		return fmt.Errorf("%w: subscription URL required", storage.ErrInvalid)
+	}
+	if len(sub.MatchJSON) == 0 {
+		return fmt.Errorf("%w: subscription match rules required", storage.ErrInvalid)
+	}
+	if len(sub.Events) == 0 {
+		sub.Events = []string{"message"}
+	}
+	eventsJSON, err := json.Marshal(sub.Events)
+	if err != nil {
+		return fmt.Errorf("sqlite: marshal events: %w", err)
+	}
+	budgetJSON := sub.BudgetJSON
+	if len(budgetJSON) == 0 {
+		budgetJSON = []byte("{}")
+	}
+	disabledAt := int64(0)
+	if !sub.DisabledAt.IsZero() {
+		disabledAt = sub.DisabledAt.UnixMicro()
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO subscriptions (id, tenant_id, account_id, channel_id, url, secret_hash, match_json, events_json, context_lines, debounce_ms, cooldown_ms, budget_json, disabled_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sub.ID.String(), tenantID.String(), sub.AccountID.String(), sub.ChannelID.String(),
+		sub.URL, sub.SecretHash, sub.MatchJSON, string(eventsJSON),
+		sub.ContextLines, sub.DebounceMs, sub.CooldownMs, budgetJSON,
+		disabledAt, sub.CreatedAt.UnixMicro(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite create subscription: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetSubscriptionByID(ctx context.Context, tenantID, id uuid.UUID) (*storage.Subscription, error) {
+	return s.scanSubscription(s.db.QueryRowContext(ctx,
+		`SELECT id, tenant_id, account_id, channel_id, url, secret_hash, match_json, events_json, context_lines, debounce_ms, cooldown_ms, budget_json, disabled_at, created_at
+		 FROM subscriptions WHERE tenant_id = ? AND id = ?`,
+		tenantID.String(), id.String()))
+}
+
+func (s *Store) ListSubscriptionsByAccount(ctx context.Context, tenantID, accountID uuid.UUID) ([]*storage.Subscription, error) {
+	return s.querySubscriptions(ctx,
+		`SELECT id, tenant_id, account_id, channel_id, url, secret_hash, match_json, events_json, context_lines, debounce_ms, cooldown_ms, budget_json, disabled_at, created_at
+		 FROM subscriptions WHERE tenant_id = ? AND account_id = ? ORDER BY created_at`,
+		tenantID.String(), accountID.String())
+}
+
+func (s *Store) ListSubscriptionsByChannel(ctx context.Context, tenantID, channelID uuid.UUID) ([]*storage.Subscription, error) {
+	return s.querySubscriptions(ctx,
+		`SELECT id, tenant_id, account_id, channel_id, url, secret_hash, match_json, events_json, context_lines, debounce_ms, cooldown_ms, budget_json, disabled_at, created_at
+		 FROM subscriptions WHERE tenant_id = ? AND channel_id = ? AND disabled_at = 0 ORDER BY created_at`,
+		tenantID.String(), channelID.String())
+}
+
+func (s *Store) UpdateSubscription(ctx context.Context, tenantID uuid.UUID, sub *storage.Subscription) error {
+	if tenantID == uuid.Nil || sub.ID == uuid.Nil {
+		return fmt.Errorf("%w: tenantID, subscription.ID required", storage.ErrInvalid)
+	}
+	eventsJSON, err := json.Marshal(sub.Events)
+	if err != nil {
+		return fmt.Errorf("sqlite: marshal events: %w", err)
+	}
+	budgetJSON := sub.BudgetJSON
+	if len(budgetJSON) == 0 {
+		budgetJSON = []byte("{}")
+	}
+	disabledAt := int64(0)
+	if !sub.DisabledAt.IsZero() {
+		disabledAt = sub.DisabledAt.UnixMicro()
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE subscriptions SET url = ?, match_json = ?, events_json = ?, context_lines = ?, debounce_ms = ?, cooldown_ms = ?, budget_json = ?, disabled_at = ?
+		 WHERE tenant_id = ? AND id = ?`,
+		sub.URL, sub.MatchJSON, string(eventsJSON), sub.ContextLines, sub.DebounceMs, sub.CooldownMs, budgetJSON, disabledAt,
+		tenantID.String(), sub.ID.String())
+	if err != nil {
+		return fmt.Errorf("sqlite update subscription: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteSubscription(ctx context.Context, tenantID, id uuid.UUID) error {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM subscriptions WHERE tenant_id = ? AND id = ?`,
+		tenantID.String(), id.String())
+	if err != nil {
+		return fmt.Errorf("sqlite delete subscription: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) RecordSubscriptionFire(ctx context.Context, f *storage.SubscriptionFire) error {
+	if f.ID == uuid.Nil {
+		var err error
+		f.ID, err = uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("sqlite: generate fire id: %w", err)
+		}
+	}
+	if f.FiredAt.IsZero() {
+		f.FiredAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO subscription_fires (id, tenant_id, subscription_id, fired_at, status, attempts, last_error) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		f.ID.String(), f.TenantID.String(), f.SubscriptionID.String(),
+		f.FiredAt.UnixMicro(), f.Status, f.Attempts, f.LastError)
+	if err != nil {
+		return fmt.Errorf("sqlite record fire: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) CountSubscriptionFiresSince(ctx context.Context, tenantID, subID uuid.UUID, since time.Time) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM subscription_fires WHERE tenant_id = ? AND subscription_id = ? AND fired_at >= ? AND status IN ('ok','retrying')`,
+		tenantID.String(), subID.String(), since.UnixMicro()).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite count fires: %w", err)
+	}
+	return n, nil
+}
+
+func (s *Store) querySubscriptions(ctx context.Context, query string, args ...any) ([]*storage.Subscription, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite query subscriptions: %w", err)
+	}
+	defer rows.Close()
+	var out []*storage.Subscription
+	for rows.Next() {
+		sub, err := s.scanSubscription(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sub)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) scanSubscription(r scanner) (*storage.Subscription, error) {
+	var (
+		id, tenantID, accountID, channelID, url, eventsJSON string
+		secretHash, matchJSON, budgetJSON                   []byte
+		contextLines, debounceMs, cooldownMs                int
+		disabledAt, createdAt                               int64
+	)
+	if err := r.Scan(&id, &tenantID, &accountID, &channelID, &url, &secretHash, &matchJSON, &eventsJSON, &contextLines, &debounceMs, &cooldownMs, &budgetJSON, &disabledAt, &createdAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("sqlite scan subscription: %w", err)
+	}
+	subID, _ := uuid.Parse(id)
+	tid, _ := uuid.Parse(tenantID)
+	aid, _ := uuid.Parse(accountID)
+	cid, _ := uuid.Parse(channelID)
+	var events []string
+	_ = json.Unmarshal([]byte(eventsJSON), &events)
+	sub := &storage.Subscription{
+		ID: subID, TenantID: tid, AccountID: aid, ChannelID: cid,
+		URL: url, SecretHash: secretHash, MatchJSON: matchJSON,
+		Events: events, ContextLines: contextLines,
+		DebounceMs: debounceMs, CooldownMs: cooldownMs,
+		BudgetJSON: budgetJSON,
+		CreatedAt:  time.UnixMicro(createdAt).UTC(),
+	}
+	if disabledAt > 0 {
+		sub.DisabledAt = time.UnixMicro(disabledAt).UTC()
+	}
+	return sub, nil
 }
 
 // --- helpers ---
