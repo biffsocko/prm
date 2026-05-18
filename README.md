@@ -2,7 +2,7 @@
 
 A high-speed, auth-required chat relay built for LLM-powered bots as first-class citizens. Similar shape to IRC — server, channels, identities, private messages — but a fresh wire protocol and modern primitives throughout.
 
-**Status:** slices 1 through 4 implemented. Real TLS server, password + token auth, multi-tenant from day one, explicit channels with ACL enforcement, bot accounts with API tokens, TUI client with reconnect, hot-standby HA pattern with operator runbook, webhook subscriptions with server-side filter pushdown / debounce / cooldown / budget caps / HMAC signing / context-attach (manageable via REST **or** native PRM-protocol verbs), and **inbound integrations**: Splunk / Graylog / generic-JSON adapters that consume external events and republish them onto a chat channel where the same subscription machinery drives bots. End-to-end tests cover both directions. Sub-ms p50 fan-out preserved. See [DESIGN.md](DESIGN.md#implementation-slices) for the full slice plan.
+**Status:** **v1.0.0** — slices 1 through 5 implemented. Real TLS server, password + token auth, multi-tenant from day one, explicit channels with ACL enforcement, bot accounts with API tokens, TUI client with reconnect, hot-standby HA pattern with operator runbook, webhook subscriptions with server-side filter pushdown / debounce / cooldown / budget caps / HMAC signing / context-attach (manageable via REST **or** native PRM-protocol verbs), **inbound integrations** (Splunk / Graylog / generic-JSON / **Datadog** / **GitHub** adapters that consume external events and republish them onto a chat channel where the same subscription machinery drives bots), first-class **@-mention rule** (no regex hack), durable **chat history** (async writer + `chathistory` retrieval verb), and a **ghost-member indicator** so webhook-only bots show up in `members` listings. End-to-end tests cover every direction. Sub-ms p50 fan-out preserved. See [DESIGN.md](DESIGN.md#implementation-slices) for the slice plan.
 
 ## Try it locally
 
@@ -258,7 +258,7 @@ POST /v1/inbound/{integration_id}
 Authorization: Bearer <integration-token>
 ```
 
-Per-source adapters (Splunk and Graylog ship as reference; a generic JSON-path adapter handles the long tail) normalize the payload, republish it as a PRM channel event, and the existing webhook subscription machinery — including the cost savings story above — drives whatever bots care to react. One mental model for chat messages, log alerts, GitHub PRs, deploy notifications.
+Per-source adapters ship as reference: **Splunk**, **Graylog**, **Datadog**, **GitHub** (push / pull_request / deployment_status / issues / release), plus a **generic JSON-path adapter** for the long tail. Each normalizes the payload, republishes it as a PRM channel event, and the existing webhook subscription machinery — including the cost savings story above — drives whatever bots care to react. One mental model for chat messages, log alerts, GitHub PRs, deploy notifications.
 
 See [DESIGN.md](DESIGN.md#inbound-integrations) for the adapter contract and the Splunk / Graylog field mappings; see [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) for the operator + integrator guide (per-source setup, generic JSON-path adapter, writing your own adapter).
 
@@ -298,7 +298,7 @@ See [DESIGN.md](DESIGN.md#comparison-to-redis-and-rabbitmq) for the dimension-by
 - **Not IRC-compatible.** Existing IRC clients (irssi, weechat, hexchat) will not connect. PRM uses a different wire protocol; you need a PRM client.
 - **Not federated.** Single deployment topology. No server-to-server linking between PRM instances or to other chat networks. Hot-standby HA within a single deployment is supported; multi-region geo-replication is not.
 - **Not anonymous.** Every connection authenticates. No anonymous join under any setting; the `public` channel visibility just means "any authenticated account may join."
-- **Not a message archive (yet).** v0 does not persist chat history. Messages exist in memory for the lifetime of an active channel. Chat history persistence and the `chathistory`-equivalent retrieval API are deferred to v1.
+- **Persistent chat history is on; retention is yours to set.** v1 persists every channel message (async writer, off the hot path) and exposes it via the `chathistory` retrieval verb. There is no built-in retention policy yet — operators should run `PurgeMessagesOlderThan` from cron if they want a window.
 
 ## Project shape (when implementation lands)
 

@@ -1,6 +1,6 @@
 # PRM Inbound Integrations — Operator + Integrator Guide
 
-This document covers how to wire external systems (Splunk, Graylog, GitHub, generic JSON sources) into PRM so their events land on a chat channel and can drive your LLM bots. For the design rationale, see [DESIGN.md](../DESIGN.md#inbound-integrations). For the outbound webhook side (what bots consume), see [WEBHOOKS.md](WEBHOOKS.md).
+This document covers how to wire external systems (Splunk, Graylog, Datadog, GitHub, generic JSON sources) into PRM so their events land on a chat channel and can drive your LLM bots. For the design rationale, see [DESIGN.md](../DESIGN.md#inbound-integrations). For the outbound webhook side (what bots consume), see [WEBHOOKS.md](WEBHOOKS.md).
 
 ## TL;DR
 
@@ -83,7 +83,7 @@ The full structured payload (the adapter's `Event.Fields` map) is preserved on t
   acme ops alertbot splunk
 ```
 
-`<tenant-slug>`, `<channel-name>`, `<owner-username>` (an existing bot or human account in the tenant; the account that "speaks" the republished events), and `<adapter>` (`splunk` | `graylog` | `generic`).
+`<tenant-slug>`, `<channel-name>`, `<owner-username>` (an existing bot or human account in the tenant; the account that "speaks" the republished events), and `<adapter>` (`splunk` | `graylog` | `datadog` | `github` | `generic`).
 
 For adapters that need per-integration configuration, pass `--settings` as a JSON string:
 
@@ -201,9 +201,90 @@ Settings options:
 
 ---
 
+## Datadog
+
+Datadog's **Webhooks** integration POSTs the configurable JSON template. The Datadog adapter understands the default template fields:
+
+```json
+{
+  "id":          "evt-1",
+  "alert_type":  "error",
+  "alert_title": "[Triggered on i-deadbeef] CPU > 90%",
+  "title":       "CPU > 90% on i-deadbeef",
+  "body":        "CPU exceeded threshold",
+  "date":        "2026-05-18T03:00:00Z",
+  "event_type":  "metric_alert",
+  "hostname":    "i-deadbeef",
+  "tags":        "env:prod,service:auth-api,team:platform",
+  "org":         {"id":"42","name":"acme"}
+}
+```
+
+Mapping:
+
+| Event field   | Source |
+|---------------|--------|
+| `Source`      | `"datadog"` |
+| `Service`     | tag value of `service:` (configurable via `service_tag` setting) |
+| `Severity`    | `alert_type` — `error→error`, `warning→warn`, `info/success→info`, unknown→`warn` |
+| `Summary`     | `title` ⇒ `alert_title` ⇒ `event_msg` ⇒ first line of `body` |
+| `Fields`      | `alert_type`, `event_type`, `hostname`, `tags` (parsed to a `key→value` map), `event_id`, `org_name`, `link` |
+| `OccurredAt`  | `date` parsed as RFC3339; falls back to `now()` |
+
+Setup in Datadog:
+1. **Integrations → Webhooks → New**
+2. **URL:** `https://prm.example.com:8443/v1/inbound/<integration-id>`
+3. **Custom Headers:** `Authorization: Bearer <token>`
+4. **Payload:** keep the default JSON template, OR customize and ensure `title`/`tags` are present.
+
+To use a tag other than `service:` to identify the PRM service:
+
+```bash
+./prmd admin create-integration \
+  --storage sqlite:./prm.db \
+  --settings '{"service_tag":"team"}' \
+  acme ops alertbot datadog
+```
+
+---
+
+## GitHub
+
+The GitHub adapter handles the common GitHub webhook event types. It reads the `X-GitHub-Event` header to dispatch per-event normalization:
+
+| Event              | Summary format                                              | Severity                    |
+|--------------------|-------------------------------------------------------------|-----------------------------|
+| `push`             | `<pusher> pushed N commit(s) to <ref>`                      | info                        |
+| `pull_request`     | `PR #N <action> by <actor>: <title>` (merged → "merged")    | info                        |
+| `deployment_status`| `deployment to <env>: <state> (by <actor>)`                 | failure/error→error, success→info, other→warn |
+| `issues`           | `issue #N <action> by <actor>: <title>`                     | info                        |
+| `release`          | `release <tag> <action> by <actor>`                         | info                        |
+
+The repository `full_name` becomes `Service` so subscriptions can filter by repo:
+
+```json
+{"any_of":[{"type":"regex","pattern":"^\\[(error|critical)\\] github/acme/payments-svc:"}]}
+```
+
+Setup in GitHub:
+1. **Settings → Webhooks → Add webhook**
+2. **Payload URL:** `https://prm.example.com:8443/v1/inbound/<integration-id>`
+3. **Content type:** `application/json`
+4. **Secret:** leave blank (PRM uses bearer-token auth on inbound, not GitHub's HMAC; if you need GitHub HMAC verification too, put a verifying proxy in front)
+5. **Authorization** isn't a native GitHub field — put the bearer in the URL via a small Lambda/Worker proxy or use a Functions-based forwarder.
+6. **Events:** select push / pull request / deployment status / issues / releases as needed.
+
+```bash
+./prmd admin create-integration \
+  --storage sqlite:./prm.db \
+  acme deploys deploybot github
+```
+
+---
+
 ## Generic adapter (anything that POSTs JSON)
 
-For GitHub webhooks, CloudWatch alarms (via SNS), Jenkins post-build hooks, Kubernetes Events forwarders, ad-hoc cron jobs, etc. Configured via a tiny JSON-path subset in `--settings`:
+For CloudWatch alarms (via SNS), Jenkins post-build hooks, Kubernetes Events forwarders, ad-hoc cron jobs, etc. (GitHub / Datadog now have typed adapters above — use those instead of generic for those vendors.) Configured via a tiny JSON-path subset in `--settings`:
 
 ```bash
 ./prmd admin create-integration \

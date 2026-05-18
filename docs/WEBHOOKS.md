@@ -94,7 +94,7 @@ Three rule kinds:
 |---|---|---|
 | `regex` | `pattern` | Go `regexp` syntax (RE2). Supports `(?i)` for case-insensitive. |
 | `glob` | `pattern` | `path.Match`-style **whole-body** match against trimmed body. |
-| `mention` | `account_id` | Matches when the message body references the given account UUID. (Slice 3 has no automatic @-mention parser yet; for now this fires when the resolved mention list contains the account_id — see [DESIGN.md open questions](../DESIGN.md#open-questions).) |
+| `mention` | `account_id` | Matches when the message body `@`-mentions the given account UUID. As of slice 5 the server auto-resolves `@username` and `@<uuid>` references in chat bodies into the account's UUID (tenant-scoped), so this rule fires on real `@`-mentions with no client-side wiring. |
 
 Examples:
 
@@ -323,7 +323,7 @@ Field semantics, payload shape, signature verification, retry policy, and budget
 
 ## What's still manual / out of scope
 
-- **@-mention parsing in the broadcast path.** The matcher supports a `mention` rule kind that checks against `Event.Mentions`, but the server doesn't yet auto-resolve `@displayname` references from message bodies. For now: use `regex` rules that match `account_id` strings (clunky) or wait for slice 5's mention parser.
+- **Field-level matching against `Event.Fields`.** Subscriptions filter on the body (`[severity] source/service: summary`). The structured fields are stashed for context-attach but not yet queryable from rules; encode what you need to filter on into the summary, or write a typed adapter that surfaces it.
 - **Outbound IP allowlisting.** PRM's webhook worker pool POSTs from whatever IP your prmd host runs on; if your bot is behind a strict firewall, you need to let that IP through. (No "static egress IP" guarantee from PRM yet.)
 - **Per-subscription `/v1/subscriptions/{id}/fires` endpoint** for audit — the `subscription_fires` table is populated, just not yet exposed via REST. Slice 4+.
 - **Web UI for subscription management.** REST + CLI + PRM-protocol verbs only for now.

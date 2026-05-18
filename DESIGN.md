@@ -578,28 +578,34 @@ Slicing the build so each step ships something useful and validates the next:
 - End-to-end test in `test/e2e/inbound_e2e_test.go` proves the path: Splunk-shape POST → adapter → republished body lands on the channel → subscription regex matches the `[error] splunk/auth-api:` prefix → signed webhook fires at the bot.
 - Operator + integrator guide in [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) covering per-source setup, the generic adapter's JSON-path config, and how to write a typed adapter for any source.
 
-**Slice 5+ — Polish and growth.**
-- Mention syntax + parsing
-- Multi-device session policy
-- Bot ghost-indicator in member lists
-- More inbound adapters (Datadog, GitHub, Jenkins, k8s Events)
-- Chat history (`chathistory` verb + durable storage of recent messages)
-- Tier 3 active-active when single-node capacity is no longer enough
+**Slice 5 — v1.0.0 polish. ✅ Implemented.**
+- **Mention parser** (`internal/mention`): resolves `@username` and `@<uuid>` in chat bodies to account UUIDs scoped to the connection's tenant. The matcher's existing `mention` rule kind now fires on real `@`-mentions, no regex hack required.
+- **Chat history persistence**: every channel message is persisted off the hot path via a bounded-channel async writer (`internal/server/history.go`, drop-on-full backpressure so broadcast never blocks). New `chathistory` / `chathistory_ok` verbs return oldest-first stored messages with optional `before_ts` paging. Same path for inbound integrations -- republished events are persisted alongside chat.
+- **Datadog + GitHub adapters**: Datadog Webhooks (configurable service-tag), GitHub events (push / pull_request / deployment_status / issues / release).
+- **Ghost-member indicator**: new `members` / `members_ok` verbs return the effective membership of a channel — live realtime connections plus any bot account with an active webhook subscription on the channel that has no live connection. Each row carries `is_ghost` + `conn_count`.
+- Tagged **v1.0.0** on GitHub.
+
+**Slice 6+ — Deferred / future.**
+- Multi-device session policy hardening (currently allows N concurrent connections; need explicit session-list verb + force-kick).
+- More inbound adapters (Jenkins, CloudWatch, k8s Events).
+- Tier 3 active-active when single-node capacity is no longer enough.
+- Retention / archival policy + admin CLI for `PurgeMessagesOlderThan`.
+- Federation, OAuth/SSO, file attachments — still out of scope for v1.
 
 ## What's not designed yet
 
-Deliberately deferred to v1+ and not blocking v0 implementation:
+Deliberately deferred to v2+ and not blocking v1 implementation:
 
-- Chat history persistence and a `chathistory` retrieval verb
 - Server-to-server federation
 - Operator framework (admin commands, kick/ban beyond channel scope)
 - OAuth / SSO integration
 - File/attachment storage
 - Voice/video (out of scope, probably forever for PRM)
+- Retention policy enforcement (storage method exists; no cron / job wired up)
 
-## Open questions
+## Resolved questions
 
-- **Mention syntax.** `@display_name` (fragile, names aren't unique) vs `@account_id` (unfriendly to type) vs `@display_name#tag` (Discord-style). Leaning Discord-style.
-- **Multi-device for a single account.** Allow N concurrent connections for one account_id, or enforce single-session? Leaning N concurrent.
-- **Bot identity in channel.** When a webhook-only bot has no live connection, should it appear in the channel member list? Leaning yes, with a "ghost" indicator.
+- **Mention syntax.** Resolved in slice 5: `@username` (tenant-scoped unique) and `@<uuid>` are both accepted. Display-name-only mentions were rejected because display names are mutable. Decoupled from regex matching so the matcher's `mention` rule fires on real mentions.
+- **Multi-device for a single account.** Resolved: N concurrent connections per account are allowed; presence emits join/part per-connection, and the new `members` verb's `conn_count` reports how many connections an account has open on the channel.
+- **Bot identity in channel.** Resolved in slice 5: bots with an active webhook subscription show up in `members_ok` with `is_ghost=true`. A bot that is *both* live and subscribed is reported once as live; `is_ghost` specifically means "row exists only because of a subscription."
 - **Wire protocol versioning.** Embed in `hello` capability negotiation, or in TLS ALPN? Leaning capability negotiation.
