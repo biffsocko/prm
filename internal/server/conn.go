@@ -18,6 +18,7 @@ import (
 
 	"github.com/biffsocko/prm/internal/auth"
 	"github.com/biffsocko/prm/internal/channels"
+	"github.com/biffsocko/prm/internal/mention"
 	"github.com/biffsocko/prm/internal/proto"
 	"github.com/biffsocko/prm/internal/webhook"
 )
@@ -562,6 +563,10 @@ func (c *Conn) handleMsg(ctx context.Context, m proto.Msg) {
 	// Notify is non-blocking (matches push onto an internal worker
 	// pool); cheap to call inline.
 	if c.srv.webhooks != nil {
+		// Resolve @-mentions in the body so the matcher's "mention"
+		// rule kind works. Quick short-circuit on bodies that don't
+		// contain '@' avoids the storage round-trip on the hot path.
+		mentions := mention.Resolve(ctx, c.srv.store, c.tenantID, m.Body)
 		c.srv.webhooks.Notify(webhook.Event{
 			TenantID:    c.tenantID,
 			ChannelID:   chanID,
@@ -570,11 +575,8 @@ func (c *Conn) handleMsg(ctx context.Context, m proto.Msg) {
 			DisplayName: c.displayName,
 			Body:        m.Body,
 			TS:          now,
-			// Mentions: slice 3 has no mention parser yet; bots can use
-			// regex-with-account-id workaround. Slice 5+ will add a
-			// proper parser.
-			Mentions: nil,
-			Context:  hist,
+			Mentions:    mentions,
+			Context:     hist,
 		})
 	}
 }
