@@ -94,6 +94,8 @@ sequenceDiagram
     Bot->>S: post triage response back into channel
 ```
 
+For the bot-author guide (creating subscriptions, verifying signatures, payload shape, retry policy, a complete minimal Python bot), see [docs/WEBHOOKS.md](docs/WEBHOOKS.md).
+
 
 ## Built for production deployments
 
