@@ -20,7 +20,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,6 +32,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -75,6 +80,12 @@ func main() {
 			os.Exit(cmdListTenants(os.Args[3:]))
 		case "list-channels":
 			os.Exit(cmdListChannels(os.Args[3:]))
+		case "create-integration":
+			os.Exit(cmdCreateIntegration(os.Args[3:]))
+		case "list-integrations":
+			os.Exit(cmdListIntegrations(os.Args[3:]))
+		case "revoke-integration":
+			os.Exit(cmdRevokeIntegration(os.Args[3:]))
 		default:
 			usage(os.Stderr)
 			os.Exit(2)
@@ -106,6 +117,9 @@ Usage (flags come BEFORE positional args):
   prmd admin generate-cert [flags] <host>
   prmd admin list-tenants [flags]
   prmd admin list-channels [flags] <tenant-slug>
+  prmd admin create-integration [flags] <tenant-slug> <channel-name> <owner-username> <adapter>
+  prmd admin list-integrations [flags] <tenant-slug>
+  prmd admin revoke-integration [flags] <tenant-slug> <integration-id>
   prmd version
 
 Run any subcommand with -h to see its flags.
@@ -615,6 +629,168 @@ func cmdListChannels(args []string) int {
 	for _, ch := range list {
 		fmt.Printf("%-36s  %-16s  %-9s  %s\n", ch.ID, ch.Name, ch.Visibility, ch.OwnerID)
 	}
+	return 0
+}
+
+// --- slice 4 admin commands: integrations ---
+
+func cmdCreateIntegration(args []string) int {
+	fs := flag.NewFlagSet("create-integration", flag.ExitOnError)
+	settings := fs.String("settings", "", "adapter settings as a JSON string (per-adapter shape); e.g. {\"service_field\":\"service\"}")
+	storageURL := fs.String("storage", "sqlite:./prm.db", "storage backend URL")
+	_ = fs.Parse(args)
+	if fs.NArg() != 4 {
+		fmt.Fprintln(os.Stderr, "usage: prmd admin create-integration [flags] <tenant-slug> <channel-name> <owner-username> <adapter>")
+		fmt.Fprintln(os.Stderr, "  adapter: splunk | graylog | generic")
+		return 2
+	}
+	tenantSlug, channelName, username, adapter := fs.Arg(0), fs.Arg(1), fs.Arg(2), fs.Arg(3)
+	settingsJSON := []byte("{}")
+	if *settings != "" {
+		var probe map[string]any
+		if err := json.Unmarshal([]byte(*settings), &probe); err != nil {
+			fmt.Fprintf(os.Stderr, "invalid --settings JSON: %v\n", err)
+			return 2
+		}
+		settingsJSON = []byte(*settings)
+	}
+
+	log := newLogger()
+	st, err := bringUpStorage(*storageURL, log)
+	if err != nil {
+		log.Error("storage open", "err", err)
+		return 1
+	}
+	defer st.Close()
+	ctx := context.Background()
+	ten, err := st.GetTenantBySlug(ctx, tenantSlug)
+	if err != nil {
+		log.Error("lookup tenant", "err", err)
+		return 1
+	}
+	ch, err := st.GetChannelByName(ctx, ten.ID, channelName)
+	if err != nil {
+		log.Error("lookup channel", "err", err)
+		return 1
+	}
+	owner, err := st.GetAccountByUsername(ctx, ten.ID, username)
+	if err != nil {
+		log.Error("lookup owner account", "err", err)
+		return 1
+	}
+
+	// Generate a fresh 32-byte bearer token.
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		log.Error("generate token", "err", err)
+		return 1
+	}
+	plaintext := base64.RawURLEncoding.EncodeToString(tokenBytes)
+	hash := sha256.Sum256([]byte(plaintext))
+
+	integ := &storage.Integration{
+		ChannelID:    ch.ID,
+		AccountID:    owner.ID,
+		Adapter:      adapter,
+		TokenHash:    hash[:],
+		SettingsJSON: settingsJSON,
+	}
+	if err := st.CreateIntegration(ctx, ten.ID, integ); err != nil {
+		log.Error("create integration", "err", err)
+		return 1
+	}
+	fmt.Printf("Created integration (token shown ONCE -- save it now)\n")
+	fmt.Printf("  ID:       %s\n", integ.ID)
+	fmt.Printf("  Tenant:   %s (%s)\n", ten.Slug, ten.ID)
+	fmt.Printf("  Channel:  #%s (%s)\n", ch.Name, ch.ID)
+	fmt.Printf("  Adapter:  %s\n", integ.Adapter)
+	fmt.Printf("  POST URL: /v1/inbound/%s\n", integ.ID)
+	fmt.Printf("  TOKEN:    %s\n", plaintext)
+	return 0
+}
+
+func cmdListIntegrations(args []string) int {
+	fs := flag.NewFlagSet("list-integrations", flag.ExitOnError)
+	storageURL := fs.String("storage", "sqlite:./prm.db", "storage backend URL")
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "usage: prmd admin list-integrations [flags] <tenant-slug>")
+		return 2
+	}
+	tenantSlug := fs.Arg(0)
+	log := newLogger()
+	st, err := bringUpStorage(*storageURL, log)
+	if err != nil {
+		log.Error("storage open", "err", err)
+		return 1
+	}
+	defer st.Close()
+	ctx := context.Background()
+	ten, err := st.GetTenantBySlug(ctx, tenantSlug)
+	if err != nil {
+		log.Error("lookup tenant", "err", err)
+		return 1
+	}
+	list, err := st.ListIntegrationsByTenant(ctx, ten.ID)
+	if err != nil {
+		log.Error("list integrations", "err", err)
+		return 1
+	}
+	if len(list) == 0 {
+		fmt.Printf("(no integrations in %s)\n", ten.Slug)
+		return 0
+	}
+	fmt.Printf("%-36s  %-10s  %-36s  %s\n", "ID", "ADAPTER", "CHANNEL_ID", "STATUS")
+	for _, i := range list {
+		status := "active"
+		if !i.DisabledAt.IsZero() {
+			status = "disabled"
+		}
+		fmt.Printf("%-36s  %-10s  %-36s  %s\n", i.ID, i.Adapter, i.ChannelID, status)
+	}
+	return 0
+}
+
+func cmdRevokeIntegration(args []string) int {
+	fs := flag.NewFlagSet("revoke-integration", flag.ExitOnError)
+	storageURL := fs.String("storage", "sqlite:./prm.db", "storage backend URL")
+	_ = fs.Parse(args)
+	if fs.NArg() != 2 {
+		fmt.Fprintln(os.Stderr, "usage: prmd admin revoke-integration [flags] <tenant-slug> <integration-id>")
+		return 2
+	}
+	tenantSlug, integIDStr := fs.Arg(0), fs.Arg(1)
+	integID, err := uuid.Parse(integIDStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid integration id: %v\n", err)
+		return 2
+	}
+	log := newLogger()
+	st, err := bringUpStorage(*storageURL, log)
+	if err != nil {
+		log.Error("storage open", "err", err)
+		return 1
+	}
+	defer st.Close()
+	ctx := context.Background()
+	ten, err := st.GetTenantBySlug(ctx, tenantSlug)
+	if err != nil {
+		log.Error("lookup tenant", "err", err)
+		return 1
+	}
+	integ, err := st.GetIntegrationByID(ctx, ten.ID, integID)
+	if err != nil {
+		log.Error("lookup integration", "err", err)
+		return 1
+	}
+	if integ.DisabledAt.IsZero() {
+		integ.DisabledAt = time.Now().UTC()
+		if err := st.UpdateIntegration(ctx, ten.ID, integ); err != nil {
+			log.Error("disable integration", "err", err)
+			return 1
+		}
+	}
+	fmt.Printf("Revoked integration %s in %s (token no longer accepted)\n", integID, ten.Slug)
 	return 0
 }
 
