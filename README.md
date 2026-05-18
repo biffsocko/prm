@@ -2,7 +2,7 @@
 
 A high-speed, auth-required chat relay built for LLM-powered bots as first-class citizens. Similar shape to IRC — server, channels, identities, private messages — but a fresh wire protocol and modern primitives throughout.
 
-**Status:** slices 1 through 3b implemented. Real TLS server, password + token auth, multi-tenant from day one, explicit channels with ACL enforcement, bot accounts with API tokens, TUI client with reconnect, hot-standby HA pattern with operator runbook, **the headline value-prop layer: webhook subscriptions with server-side filter pushdown, debounce + cooldown + budget caps, HMAC-signed POSTs, and context-attach** — manageable via **both** the REST control plane (`curl`-friendly, port 8443) **and** native verbs on the realtime PRM protocol (no separate HTTP client needed for bots). End-to-end tests cover both paths. Sub-ms p50 fan-out preserved. See [DESIGN.md](DESIGN.md#implementation-slices) for the full slice plan.
+**Status:** slices 1 through 4 implemented. Real TLS server, password + token auth, multi-tenant from day one, explicit channels with ACL enforcement, bot accounts with API tokens, TUI client with reconnect, hot-standby HA pattern with operator runbook, webhook subscriptions with server-side filter pushdown / debounce / cooldown / budget caps / HMAC signing / context-attach (manageable via REST **or** native PRM-protocol verbs), and **inbound integrations**: Splunk / Graylog / generic-JSON adapters that consume external events and republish them onto a chat channel where the same subscription machinery drives bots. End-to-end tests cover both directions. Sub-ms p50 fan-out preserved. See [DESIGN.md](DESIGN.md#implementation-slices) for the full slice plan.
 
 ## Try it locally
 
@@ -260,7 +260,7 @@ Authorization: Bearer <integration-token>
 
 Per-source adapters (Splunk and Graylog ship as reference; a generic JSON-path adapter handles the long tail) normalize the payload, republish it as a PRM channel event, and the existing webhook subscription machinery — including the cost savings story above — drives whatever bots care to react. One mental model for chat messages, log alerts, GitHub PRs, deploy notifications.
 
-See [DESIGN.md](DESIGN.md#inbound-integrations) for the adapter contract and the Splunk / Graylog field mappings.
+See [DESIGN.md](DESIGN.md#inbound-integrations) for the adapter contract and the Splunk / Graylog field mappings; see [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) for the operator + integrator guide (per-source setup, generic JSON-path adapter, writing your own adapter).
 
 ```mermaid
 sequenceDiagram

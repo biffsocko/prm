@@ -567,10 +567,16 @@ Slicing the build so each step ships something useful and validates the next:
 - REST and protocol paths share `internal/subops` for validation, channel resolution, secret generation, cross-account isolation, and webhook-manager updates so the two surfaces stay in lockstep.
 - End-to-end test in `test/e2e/subscriptions_proto_test.go` proves the round-trip: bot connects, token-auths, creates/lists/gets/updates/deletes subscriptions over the protocol, and the resulting subscription fires webhooks for real chat messages with HMAC signatures verifying against the secret obtained via the protocol response.
 
-**Slice 4 — Inbound integrations.**
-- `POST /v1/inbound/{integration_id}` endpoint
-- Adapter registry; Splunk, Graylog, and generic JSON-path adapters ship as reference
-- Per-integration rate limit, optional HMAC signing
+**Slice 4 — Inbound integrations. ✅ Implemented.**
+- `POST /v1/inbound/{integration_id}` endpoint on the existing REST listener, separate auth surface from the bot-token bot-management endpoints.
+- Adapter registry (`internal/inbound`) with three reference implementations: **Splunk** (parses Webhook alert-action payload, derives severity from `search_name`), **Graylog** (parses HTTP Notification, severity from `event.fields.level` or `event.priority`), **generic** (JSON-path-configured for the long tail — GitHub / Jenkins / CloudWatch / k8s Events / cron).
+- Normalized `inbound.Event` shape (`Source`, `Service`, `Severity`, `Summary`, `Fields`, `OccurredAt`, `Raw`) flows into a `server.Server.PublishInbound` bridge that broadcasts + AppendHistory + webhook.Notify — same downstream as a real chat message.
+- Wire body format: `[severity] source/service: summary` — subscription matchers filter with regex against this.
+- Token-based auth at SHA-256 hash; revocation via `prmd admin revoke-integration` immediately stops the token from being accepted.
+- 64 KB body cap. Suspended-tenant block. Path-id-vs-token cross-check.
+- `prmd admin create-integration / list-integrations / revoke-integration` for operator workflow.
+- End-to-end test in `test/e2e/inbound_e2e_test.go` proves the path: Splunk-shape POST → adapter → republished body lands on the channel → subscription regex matches the `[error] splunk/auth-api:` prefix → signed webhook fires at the bot.
+- Operator + integrator guide in [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) covering per-source setup, the generic adapter's JSON-path config, and how to write a typed adapter for any source.
 
 **Slice 5+ — Polish and growth.**
 - Mention syntax + parsing

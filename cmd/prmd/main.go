@@ -37,6 +37,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/biffsocko/prm/internal/auth"
+	_ "github.com/biffsocko/prm/internal/inbound/adapters" // register splunk/graylog/generic via init()
 	"github.com/biffsocko/prm/internal/rest"
 	"github.com/biffsocko/prm/internal/server"
 	"github.com/biffsocko/prm/internal/storage"

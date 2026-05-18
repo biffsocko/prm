@@ -10,7 +10,7 @@ The standout design choice: **server-side filter pushdown for bot subscriptions.
 
 ## Project state
 
-**Slices 1, 2, and 3 complete.** A working TLS PRM server (`prmd`) and reference TUI client (`prm`) with:
+**Slices 1 through 4 complete.** A working TLS PRM server (`prmd`) and reference TUI client (`prm`) with:
 
 - Multi-tenant SQLite storage; Postgres backend is a stub awaiting a real Postgres to validate against
 - Password auth (Argon2id, 3-frame challenge/response handshake)
@@ -26,8 +26,9 @@ The standout design choice: **server-side filter pushdown for bot subscriptions.
 - End-to-end integration test in `test/e2e/` proves the full path: chat → matcher → signed POST → verified payload with context.
 
 - **Subscription verbs over the realtime protocol (slice 3b)**: `subscription_create` / `_list` / `_get` / `_update` / `_delete` on the JSON-line wire. Same business logic as REST via shared `internal/subops` package. End-to-end test exercises the full protocol path including HMAC verification of webhooks fired against a secret obtained over the protocol.
+- **Inbound integrations (slice 4)**: `POST /v1/inbound/{integration_id}` on the REST listener. Adapter registry in `internal/inbound` with reference adapters for Splunk / Graylog / generic JSON-path (`internal/inbound/adapters/`). `server.Server.PublishInbound` bridges normalized events onto a channel via the same broadcast+history+notify path as chat messages. Operator runbook at [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md). End-to-end test runs a Splunk-shape POST through the whole stack and verifies the resulting webhook fires with the right body + signature.
 
-Slices 4+ ahead (inbound integrations, chat history, federation, etc.): see [DESIGN.md](DESIGN.md#implementation-slices).
+Slices 5+ ahead (chat history, federation, mention parser, etc.): see [DESIGN.md](DESIGN.md#implementation-slices).
 
 Headline numbers from `go test -p 1 -run TestFanoutLatency -v ./test/bench/` on Apple Silicon:
 
@@ -78,9 +79,11 @@ prm/
     tenants/               # tenant model, quotas, settings, platform-admin operations
     matcher/               # subscription match-rule compiler + evaluator (regex/glob/mention)
     webhook/               # outbound webhook delivery: HMAC signing + retry + debounce + cooldown + budget
-    rest/                  # REST control plane: subscription CRUD on :8443
+    rest/                  # REST control plane: subscription CRUD + inbound /v1/inbound/{id} on :8443
     subops/                # shared business logic for subscription CRUD; called by both
                            # rest/ (HTTP) and server/ (PRM-protocol verbs in slice 3b)
+    inbound/               # adapter registry + Event shape for inbound integrations
+      adapters/            # registers splunk / graylog / generic adapters via init()
     rest/                  # HTTP control plane (account/channel/subscription/integration CRUD)
     webhook/               # subscription matcher, debounce buffer, signed HTTP POST worker pool
     inbound/               # inbound integration receiver: POST /v1/inbound/{id} handler + adapter registry
