@@ -227,6 +227,8 @@ func (c *Conn) dispatch(ctx context.Context, f proto.Frame) {
 		c.handleSubscriptionDelete(ctx, v)
 	case proto.ChatHistory:
 		c.handleChatHistory(ctx, v)
+	case proto.Members:
+		c.handleMembers(ctx, v)
 	default:
 		c.sendError("unsupported", fmt.Sprintf("verb %q not supported", f.FrameType()), "")
 	}

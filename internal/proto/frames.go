@@ -43,6 +43,8 @@ const (
 	TypeSubscriptionDeleted  = "subscription_deleted"
 	TypeChatHistory          = "chathistory"
 	TypeChatHistoryOK        = "chathistory_ok"
+	TypeMembers              = "members"
+	TypeMembersOK            = "members_ok"
 )
 
 // Auth methods.
@@ -360,6 +362,48 @@ type StoredMessageWire struct {
 	TS   time.Time `json:"ts"`
 	Body string    `json:"body"`
 }
+
+// Members asks the server for the membership of a channel. Returns
+// MembersOK on success. Includes live connections AND any "ghost"
+// members -- bot accounts that have an active webhook subscription
+// on the channel but no live realtime connection. Ghosts let humans
+// see "who's effectively listening on this channel" even when the
+// bots only receive via webhook delivery.
+type Members struct {
+	Type    string `json:"type"`
+	ID      string `json:"id,omitempty"`
+	Channel string `json:"channel"`
+}
+
+func (Members) FrameType() string { return TypeMembers }
+
+// MemberInfo is one row in MembersOK's list.
+//
+// AccountType is "human" or "bot". IsGhost is true when the row was
+// derived from an active webhook subscription rather than a live
+// realtime connection -- a ghost will receive events via webhook but
+// is NOT connected to the realtime socket.
+//
+// ConnCount counts how many live realtime connections this account has
+// open on the channel. Zero for ghosts. Useful for UIs that want to
+// render multi-device presence.
+type MemberInfo struct {
+	AccountID   string `json:"account_id"`
+	DisplayName string `json:"display_name,omitempty"`
+	AccountType string `json:"account_type"` // "human" | "bot"
+	IsGhost     bool   `json:"is_ghost"`
+	ConnCount   int    `json:"conn_count"`
+}
+
+// MembersOK is the server's response to a Members request.
+type MembersOK struct {
+	Type    string       `json:"type"`
+	ID      string       `json:"id,omitempty"`
+	Channel string       `json:"channel"`
+	Members []MemberInfo `json:"members"`
+}
+
+func (MembersOK) FrameType() string { return TypeMembersOK }
 
 // Error is the generic error frame. Reason is a stable machine-readable code
 // (e.g., "not_authenticated", "channel_not_found", "rate_limited"); Detail

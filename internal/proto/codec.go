@@ -220,6 +220,10 @@ func frameForType(t string) (Frame, error) {
 		return &ChatHistory{}, nil
 	case TypeChatHistoryOK:
 		return &ChatHistoryOK{}, nil
+	case TypeMembers:
+		return &Members{}, nil
+	case TypeMembersOK:
+		return &MembersOK{}, nil
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownType, t)
 	}
@@ -277,6 +281,10 @@ func derefFrame(f Frame) Frame {
 	case *ChatHistory:
 		return *v
 	case *ChatHistoryOK:
+		return *v
+	case *Members:
+		return *v
+	case *MembersOK:
 		return *v
 	default:
 		return f
