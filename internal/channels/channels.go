@@ -24,6 +24,7 @@ package channels
 import (
 	"hash/fnv"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -50,6 +51,21 @@ type Member interface {
 	Enqueue([]byte)
 }
 
+// HistoryEntry is one stored channel message in the in-memory ring buffer
+// used for webhook context-attach. Bodies are stored unmodified; timestamps
+// are server-stamped.
+type HistoryEntry struct {
+	From        uuid.UUID
+	DisplayName string
+	TS          time.Time
+	Body        string
+}
+
+// defaultHistorySize is how many recent messages each channel retains
+// for context-attach on webhook fires. Tunable per channel later;
+// 32 is a comfortable default for slice 3.
+const defaultHistorySize = 32
+
 // Channel is a single channel's in-memory state.
 type Channel struct {
 	TenantID uuid.UUID
@@ -58,6 +74,13 @@ type Channel struct {
 
 	mu      sync.RWMutex
 	members map[uuid.UUID]Member // keyed by ConnID
+
+	// History ring buffer for webhook context-attach. Protected by histMu
+	// (separate from mu so a webhook reader doesn't block fan-out and
+	// vice versa).
+	histMu  sync.Mutex
+	hist    []HistoryEntry
+	histPos int // next write index
 }
 
 // newChannel creates an empty channel.
@@ -67,6 +90,7 @@ func newChannel(tenantID, id uuid.UUID, name string) *Channel {
 		ID:       id,
 		Name:     name,
 		members:  make(map[uuid.UUID]Member, 8),
+		hist:     make([]HistoryEntry, defaultHistorySize),
 	}
 }
 
@@ -121,6 +145,47 @@ func (c *Channel) BroadcastExcept(bytes []byte, skipConn uuid.UUID) {
 		}
 		m.Enqueue(bytes)
 	}
+}
+
+// AppendHistory records one message in the channel's ring buffer for
+// webhook context-attach. Fast: takes a separate mutex from the member
+// list so it doesn't contend with broadcast fan-out.
+func (c *Channel) AppendHistory(e HistoryEntry) {
+	c.histMu.Lock()
+	c.hist[c.histPos] = e
+	c.histPos = (c.histPos + 1) % len(c.hist)
+	c.histMu.Unlock()
+}
+
+// RecentMessages returns up to n most-recent messages from the ring buffer,
+// oldest first. If n is 0 or negative, returns an empty slice.
+// If n exceeds the ring depth, returns all messages currently in the
+// buffer.
+func (c *Channel) RecentMessages(n int) []HistoryEntry {
+	if n <= 0 {
+		return nil
+	}
+	c.histMu.Lock()
+	defer c.histMu.Unlock()
+	depth := len(c.hist)
+	if n > depth {
+		n = depth
+	}
+	out := make([]HistoryEntry, 0, n)
+	// Walk backwards from histPos to pick up the n most recent entries.
+	for i := 0; i < n; i++ {
+		idx := (c.histPos - 1 - i + depth) % depth
+		e := c.hist[idx]
+		if e.TS.IsZero() && e.Body == "" {
+			break // ring not full yet; reached unused slot
+		}
+		out = append(out, e)
+	}
+	// Reverse for oldest-first order.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
 }
 
 // MemberCount returns the current member count. Approximate under concurrent
