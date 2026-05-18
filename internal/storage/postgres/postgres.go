@@ -112,3 +112,21 @@ func (*Store) RecordSubscriptionFire(context.Context, *storage.SubscriptionFire)
 func (*Store) CountSubscriptionFiresSince(context.Context, uuid.UUID, uuid.UUID, time.Time) (int, error) {
 	return 0, ErrNotImplemented
 }
+func (*Store) CreateIntegration(context.Context, uuid.UUID, *storage.Integration) error {
+	return ErrNotImplemented
+}
+func (*Store) GetIntegrationByID(context.Context, uuid.UUID, uuid.UUID) (*storage.Integration, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) GetIntegrationByTokenHash(context.Context, []byte) (*storage.Integration, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) ListIntegrationsByTenant(context.Context, uuid.UUID) ([]*storage.Integration, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) UpdateIntegration(context.Context, uuid.UUID, *storage.Integration) error {
+	return ErrNotImplemented
+}
+func (*Store) DeleteIntegration(context.Context, uuid.UUID, uuid.UUID) error {
+	return ErrNotImplemented
+}

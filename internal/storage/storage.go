@@ -157,6 +157,27 @@ type SubscriptionFire struct {
 	LastError      string
 }
 
+// Integration is an inbound webhook source binding: an external system
+// (Splunk, Graylog, GitHub, generic-JSON, etc.) gets a bearer token and
+// a URL it POSTs to. The adapter is identified by name; per-integration
+// adapter settings (e.g., JSON paths for the generic adapter) are stored
+// as opaque JSON.
+//
+// Bound to a single channel — every accepted POST republishes a message
+// onto that channel. AccountID is the account "speaking" the republished
+// messages; it should typically be a bot account.
+type Integration struct {
+	ID           uuid.UUID
+	TenantID     uuid.UUID
+	ChannelID    uuid.UUID
+	AccountID    uuid.UUID // the account that "speaks" the republished events
+	Adapter      string    // "splunk" | "graylog" | "generic" | ...
+	TokenHash    []byte    // SHA-256 of the plaintext bearer token; plaintext shown once
+	SettingsJSON []byte    // adapter-specific config, opaque to storage
+	DisabledAt   time.Time
+	CreatedAt    time.Time
+}
+
 // Token is an API token issued to a bot account. The plaintext token is
 // shown to the user exactly once at issuance; only the SHA-256 hash is
 // stored. Lookup is by hash (the server hashes the bearer token on auth
@@ -225,4 +246,14 @@ type Store interface {
 	// Subscription fires (for budget accounting + audit)
 	RecordSubscriptionFire(ctx context.Context, fire *SubscriptionFire) error
 	CountSubscriptionFiresSince(ctx context.Context, tenantID, subID uuid.UUID, since time.Time) (int, error)
+
+	// Integrations (inbound event sources). Like GetTokenByHash, the
+	// hash-based lookup is intentionally tenant-less: the token IS the
+	// proof of which tenant the caller belongs to.
+	CreateIntegration(ctx context.Context, tenantID uuid.UUID, integ *Integration) error
+	GetIntegrationByID(ctx context.Context, tenantID, id uuid.UUID) (*Integration, error)
+	GetIntegrationByTokenHash(ctx context.Context, hash []byte) (*Integration, error)
+	ListIntegrationsByTenant(ctx context.Context, tenantID uuid.UUID) ([]*Integration, error)
+	UpdateIntegration(ctx context.Context, tenantID uuid.UUID, integ *Integration) error
+	DeleteIntegration(ctx context.Context, tenantID, id uuid.UUID) error
 }

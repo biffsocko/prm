@@ -152,6 +152,20 @@ var migrations = []string{
 		FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
 	) STRICT`,
 	`CREATE INDEX IF NOT EXISTS subscription_fires_subid_fired_idx ON subscription_fires(tenant_id, subscription_id, fired_at)`,
+	`CREATE TABLE IF NOT EXISTS integrations (
+		id            TEXT PRIMARY KEY,
+		tenant_id     TEXT NOT NULL,
+		channel_id    TEXT NOT NULL,
+		account_id    TEXT NOT NULL,
+		adapter       TEXT NOT NULL,
+		token_hash    BLOB NOT NULL UNIQUE,
+		settings_json BLOB NOT NULL DEFAULT '{}',
+		disabled_at   INTEGER NOT NULL DEFAULT 0,
+		created_at    INTEGER NOT NULL,
+		FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+	) STRICT`,
+	`CREATE INDEX IF NOT EXISTS integrations_token_idx ON integrations(token_hash)`,
+	`CREATE INDEX IF NOT EXISTS integrations_tenant_idx ON integrations(tenant_id)`,
 }
 
 // CreateTenant inserts a new tenant. If t.ID is zero, a UUID v7 is generated.
@@ -709,6 +723,163 @@ func (s *Store) scanSubscription(r scanner) (*storage.Subscription, error) {
 		sub.DisabledAt = time.UnixMicro(disabledAt).UTC()
 	}
 	return sub, nil
+}
+
+// --- integrations ---
+
+func (s *Store) CreateIntegration(ctx context.Context, tenantID uuid.UUID, integ *storage.Integration) error {
+	if tenantID == uuid.Nil {
+		return fmt.Errorf("%w: tenantID required", storage.ErrInvalid)
+	}
+	if integ.TenantID != uuid.Nil && integ.TenantID != tenantID {
+		return fmt.Errorf("%w: integration.TenantID does not match argument tenantID", storage.ErrInvalid)
+	}
+	integ.TenantID = tenantID
+	if integ.ID == uuid.Nil {
+		var err error
+		integ.ID, err = uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("sqlite: generate integration id: %w", err)
+		}
+	}
+	if integ.CreatedAt.IsZero() {
+		integ.CreatedAt = time.Now().UTC()
+	}
+	if integ.Adapter == "" {
+		return fmt.Errorf("%w: adapter required", storage.ErrInvalid)
+	}
+	if len(integ.TokenHash) == 0 {
+		return fmt.Errorf("%w: token_hash required", storage.ErrInvalid)
+	}
+	if integ.ChannelID == uuid.Nil || integ.AccountID == uuid.Nil {
+		return fmt.Errorf("%w: channel_id and account_id required", storage.ErrInvalid)
+	}
+	settings := integ.SettingsJSON
+	if len(settings) == 0 {
+		settings = []byte("{}")
+	}
+	disabledAt := int64(0)
+	if !integ.DisabledAt.IsZero() {
+		disabledAt = integ.DisabledAt.UnixMicro()
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO integrations (id, tenant_id, channel_id, account_id, adapter, token_hash, settings_json, disabled_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		integ.ID.String(), tenantID.String(), integ.ChannelID.String(), integ.AccountID.String(),
+		integ.Adapter, integ.TokenHash, settings, disabledAt, integ.CreatedAt.UnixMicro(),
+	)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return fmt.Errorf("%w: integration token hash collision", storage.ErrAlreadyExists)
+		}
+		return fmt.Errorf("sqlite create integration: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetIntegrationByID(ctx context.Context, tenantID, id uuid.UUID) (*storage.Integration, error) {
+	return s.scanIntegration(s.db.QueryRowContext(ctx,
+		`SELECT id, tenant_id, channel_id, account_id, adapter, token_hash, settings_json, disabled_at, created_at
+		 FROM integrations WHERE tenant_id = ? AND id = ?`,
+		tenantID.String(), id.String()))
+}
+
+// GetIntegrationByTokenHash is intentionally tenant-less. The token IS
+// the proof of tenancy -- the caller hashed an inbound bearer token and
+// is asking "which integration is this?". The result carries tenant_id.
+// Returns ErrNotFound if not found or disabled.
+func (s *Store) GetIntegrationByTokenHash(ctx context.Context, hash []byte) (*storage.Integration, error) {
+	return s.scanIntegration(s.db.QueryRowContext(ctx,
+		`SELECT id, tenant_id, channel_id, account_id, adapter, token_hash, settings_json, disabled_at, created_at
+		 FROM integrations WHERE token_hash = ? AND disabled_at = 0`, hash))
+}
+
+func (s *Store) ListIntegrationsByTenant(ctx context.Context, tenantID uuid.UUID) ([]*storage.Integration, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, tenant_id, channel_id, account_id, adapter, token_hash, settings_json, disabled_at, created_at
+		 FROM integrations WHERE tenant_id = ? ORDER BY created_at`,
+		tenantID.String())
+	if err != nil {
+		return nil, fmt.Errorf("sqlite list integrations: %w", err)
+	}
+	defer rows.Close()
+	var out []*storage.Integration
+	for rows.Next() {
+		i, err := s.scanIntegration(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, i)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpdateIntegration(ctx context.Context, tenantID uuid.UUID, integ *storage.Integration) error {
+	if tenantID == uuid.Nil || integ.ID == uuid.Nil {
+		return fmt.Errorf("%w: tenantID and integration.ID required", storage.ErrInvalid)
+	}
+	settings := integ.SettingsJSON
+	if len(settings) == 0 {
+		settings = []byte("{}")
+	}
+	disabledAt := int64(0)
+	if !integ.DisabledAt.IsZero() {
+		disabledAt = integ.DisabledAt.UnixMicro()
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE integrations SET channel_id = ?, account_id = ?, adapter = ?, settings_json = ?, disabled_at = ?
+		 WHERE tenant_id = ? AND id = ?`,
+		integ.ChannelID.String(), integ.AccountID.String(), integ.Adapter, settings, disabledAt,
+		tenantID.String(), integ.ID.String())
+	if err != nil {
+		return fmt.Errorf("sqlite update integration: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteIntegration(ctx context.Context, tenantID, id uuid.UUID) error {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM integrations WHERE tenant_id = ? AND id = ?`,
+		tenantID.String(), id.String())
+	if err != nil {
+		return fmt.Errorf("sqlite delete integration: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) scanIntegration(r scanner) (*storage.Integration, error) {
+	var (
+		id, tenantID, channelID, accountID, adapter string
+		tokenHash, settingsJSON                     []byte
+		disabledAt, createdAt                       int64
+	)
+	if err := r.Scan(&id, &tenantID, &channelID, &accountID, &adapter, &tokenHash, &settingsJSON, &disabledAt, &createdAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("sqlite scan integration: %w", err)
+	}
+	iid, _ := uuid.Parse(id)
+	tid, _ := uuid.Parse(tenantID)
+	cid, _ := uuid.Parse(channelID)
+	aid, _ := uuid.Parse(accountID)
+	out := &storage.Integration{
+		ID: iid, TenantID: tid, ChannelID: cid, AccountID: aid,
+		Adapter: adapter, TokenHash: tokenHash, SettingsJSON: settingsJSON,
+		CreatedAt: time.UnixMicro(createdAt).UTC(),
+	}
+	if disabledAt > 0 {
+		out.DisabledAt = time.UnixMicro(disabledAt).UTC()
+	}
+	return out, nil
 }
 
 // --- helpers ---
