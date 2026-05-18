@@ -118,13 +118,22 @@ type ChannelACLEntry struct {
 // Subscription is a webhook subscription owned by a bot account. The
 // match rules and budget are stored as JSON; the package matcher
 // (internal/matcher) compiles them.
+//
+// Note on Secret: this is the plaintext HMAC signing secret, not a
+// hash. The server needs the plaintext to sign outbound webhook POSTs;
+// the bot's webhook receiver needs it to verify. It's generated at
+// subscription creation and returned to the caller exactly once; the
+// caller is responsible for stashing it in their bot's config. Stored
+// at rest in the DB — if you need confidentiality beyond filesystem /
+// DB ACL, encrypt the column at the storage layer (out of scope for
+// slice 3).
 type Subscription struct {
 	ID           uuid.UUID
 	TenantID     uuid.UUID
 	AccountID    uuid.UUID // owner (a bot account)
 	ChannelID    uuid.UUID
 	URL          string
-	SecretHash   []byte   // SHA-256 of the plaintext HMAC secret; plaintext shown once
+	Secret       []byte   // plaintext HMAC signing secret (see note above)
 	MatchJSON    []byte   // serialized match rules; opaque to storage
 	Events       []string // e.g. ["message"]
 	ContextLines int

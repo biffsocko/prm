@@ -49,7 +49,7 @@ func TestSubscriptionCRUD(t *testing.T) {
 	sub := &storage.Subscription{
 		AccountID: bot.ID, ChannelID: ch.ID,
 		URL:          "https://bot.example.com/prm-webhook",
-		SecretHash:   sha256Sum("webhook-secret"),
+		Secret:   sha256Sum("webhook-secret"),
 		MatchJSON:    matchJSON,
 		Events:       []string{"message"},
 		ContextLines: 8,
@@ -150,7 +150,7 @@ func TestSubscriptionCrossTenantIsolation(t *testing.T) {
 	}
 
 	match, _ := json.Marshal(map[string]any{"any_of": []map[string]any{{"type": "regex", "pattern": "x"}}})
-	sub := &storage.Subscription{AccountID: bot.ID, ChannelID: ch.ID, URL: "https://x", SecretHash: sha256Sum("s"), MatchJSON: match}
+	sub := &storage.Subscription{AccountID: bot.ID, ChannelID: ch.ID, URL: "https://x", Secret: sha256Sum("s"), MatchJSON: match}
 	if err := s.CreateSubscription(ctx, ten.ID, sub); err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestSubscriptionFiresCount(t *testing.T) {
 	ten, bot, ch, s := mkTenantAccountChannel(t)
 	ctx := context.Background()
 	match, _ := json.Marshal(map[string]any{"any_of": []map[string]any{{"type": "regex", "pattern": "x"}}})
-	sub := &storage.Subscription{AccountID: bot.ID, ChannelID: ch.ID, URL: "https://x", SecretHash: sha256Sum("s"), MatchJSON: match}
+	sub := &storage.Subscription{AccountID: bot.ID, ChannelID: ch.ID, URL: "https://x", Secret: sha256Sum("s"), MatchJSON: match}
 	if err := s.CreateSubscription(ctx, ten.ID, sub); err != nil {
 		t.Fatal(err)
 	}

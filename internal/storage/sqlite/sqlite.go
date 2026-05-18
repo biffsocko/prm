@@ -128,7 +128,7 @@ var migrations = []string{
 		account_id    TEXT NOT NULL,
 		channel_id    TEXT NOT NULL,
 		url           TEXT NOT NULL,
-		secret_hash   BLOB NOT NULL,
+		secret        BLOB NOT NULL,
 		match_json    BLOB NOT NULL,
 		events_json   TEXT NOT NULL DEFAULT '["message"]',
 		context_lines INTEGER NOT NULL DEFAULT 0,
@@ -550,10 +550,10 @@ func (s *Store) CreateSubscription(ctx context.Context, tenantID uuid.UUID, sub 
 		disabledAt = sub.DisabledAt.UnixMicro()
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO subscriptions (id, tenant_id, account_id, channel_id, url, secret_hash, match_json, events_json, context_lines, debounce_ms, cooldown_ms, budget_json, disabled_at, created_at)
+		`INSERT INTO subscriptions (id, tenant_id, account_id, channel_id, url, secret, match_json, events_json, context_lines, debounce_ms, cooldown_ms, budget_json, disabled_at, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sub.ID.String(), tenantID.String(), sub.AccountID.String(), sub.ChannelID.String(),
-		sub.URL, sub.SecretHash, sub.MatchJSON, string(eventsJSON),
+		sub.URL, sub.Secret, sub.MatchJSON, string(eventsJSON),
 		sub.ContextLines, sub.DebounceMs, sub.CooldownMs, budgetJSON,
 		disabledAt, sub.CreatedAt.UnixMicro(),
 	)
@@ -565,21 +565,21 @@ func (s *Store) CreateSubscription(ctx context.Context, tenantID uuid.UUID, sub 
 
 func (s *Store) GetSubscriptionByID(ctx context.Context, tenantID, id uuid.UUID) (*storage.Subscription, error) {
 	return s.scanSubscription(s.db.QueryRowContext(ctx,
-		`SELECT id, tenant_id, account_id, channel_id, url, secret_hash, match_json, events_json, context_lines, debounce_ms, cooldown_ms, budget_json, disabled_at, created_at
+		`SELECT id, tenant_id, account_id, channel_id, url, secret, match_json, events_json, context_lines, debounce_ms, cooldown_ms, budget_json, disabled_at, created_at
 		 FROM subscriptions WHERE tenant_id = ? AND id = ?`,
 		tenantID.String(), id.String()))
 }
 
 func (s *Store) ListSubscriptionsByAccount(ctx context.Context, tenantID, accountID uuid.UUID) ([]*storage.Subscription, error) {
 	return s.querySubscriptions(ctx,
-		`SELECT id, tenant_id, account_id, channel_id, url, secret_hash, match_json, events_json, context_lines, debounce_ms, cooldown_ms, budget_json, disabled_at, created_at
+		`SELECT id, tenant_id, account_id, channel_id, url, secret, match_json, events_json, context_lines, debounce_ms, cooldown_ms, budget_json, disabled_at, created_at
 		 FROM subscriptions WHERE tenant_id = ? AND account_id = ? ORDER BY created_at`,
 		tenantID.String(), accountID.String())
 }
 
 func (s *Store) ListSubscriptionsByChannel(ctx context.Context, tenantID, channelID uuid.UUID) ([]*storage.Subscription, error) {
 	return s.querySubscriptions(ctx,
-		`SELECT id, tenant_id, account_id, channel_id, url, secret_hash, match_json, events_json, context_lines, debounce_ms, cooldown_ms, budget_json, disabled_at, created_at
+		`SELECT id, tenant_id, account_id, channel_id, url, secret, match_json, events_json, context_lines, debounce_ms, cooldown_ms, budget_json, disabled_at, created_at
 		 FROM subscriptions WHERE tenant_id = ? AND channel_id = ? AND disabled_at = 0 ORDER BY created_at`,
 		tenantID.String(), channelID.String())
 }
@@ -681,11 +681,11 @@ func (s *Store) querySubscriptions(ctx context.Context, query string, args ...an
 func (s *Store) scanSubscription(r scanner) (*storage.Subscription, error) {
 	var (
 		id, tenantID, accountID, channelID, url, eventsJSON string
-		secretHash, matchJSON, budgetJSON                   []byte
+		secret, matchJSON, budgetJSON                   []byte
 		contextLines, debounceMs, cooldownMs                int
 		disabledAt, createdAt                               int64
 	)
-	if err := r.Scan(&id, &tenantID, &accountID, &channelID, &url, &secretHash, &matchJSON, &eventsJSON, &contextLines, &debounceMs, &cooldownMs, &budgetJSON, &disabledAt, &createdAt); err != nil {
+	if err := r.Scan(&id, &tenantID, &accountID, &channelID, &url, &secret, &matchJSON, &eventsJSON, &contextLines, &debounceMs, &cooldownMs, &budgetJSON, &disabledAt, &createdAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, storage.ErrNotFound
 		}
@@ -699,7 +699,7 @@ func (s *Store) scanSubscription(r scanner) (*storage.Subscription, error) {
 	_ = json.Unmarshal([]byte(eventsJSON), &events)
 	sub := &storage.Subscription{
 		ID: subID, TenantID: tid, AccountID: aid, ChannelID: cid,
-		URL: url, SecretHash: secretHash, MatchJSON: matchJSON,
+		URL: url, Secret: secret, MatchJSON: matchJSON,
 		Events: events, ContextLines: contextLines,
 		DebounceMs: debounceMs, CooldownMs: cooldownMs,
 		BudgetJSON: budgetJSON,
