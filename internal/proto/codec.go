@@ -200,6 +200,22 @@ func frameForType(t string) (Frame, error) {
 		return &Pong{}, nil
 	case TypeError:
 		return &Error{}, nil
+	case TypeSubscriptionCreate:
+		return &SubscriptionCreate{}, nil
+	case TypeSubscriptionList:
+		return &SubscriptionList{}, nil
+	case TypeSubscriptionGet:
+		return &SubscriptionGet{}, nil
+	case TypeSubscriptionUpdate:
+		return &SubscriptionUpdate{}, nil
+	case TypeSubscriptionDelete:
+		return &SubscriptionDelete{}, nil
+	case TypeSubscriptionOK:
+		return &SubscriptionOK{}, nil
+	case TypeSubscriptionListOK:
+		return &SubscriptionListOK{}, nil
+	case TypeSubscriptionDeleted:
+		return &SubscriptionDeleted{}, nil
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownType, t)
 	}
@@ -237,6 +253,22 @@ func derefFrame(f Frame) Frame {
 	case *Pong:
 		return *v
 	case *Error:
+		return *v
+	case *SubscriptionCreate:
+		return *v
+	case *SubscriptionList:
+		return *v
+	case *SubscriptionGet:
+		return *v
+	case *SubscriptionUpdate:
+		return *v
+	case *SubscriptionDelete:
+		return *v
+	case *SubscriptionOK:
+		return *v
+	case *SubscriptionListOK:
+		return *v
+	case *SubscriptionDeleted:
 		return *v
 	default:
 		return f

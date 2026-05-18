@@ -25,7 +25,9 @@ The standout design choice: **server-side filter pushdown for bot subscriptions.
 - **Webhook subscriptions (slice 3)**: `internal/matcher` (regex/glob/mention, any_of/all_of), `internal/webhook` (HMAC-signed POST worker pool with retry + debounce + cooldown + daily budget caps), `internal/rest` (REST control plane on :8443 with bearer-token auth, subscription CRUD). Server's broadcast path calls `WebhookMgr.Notify` after fan-out so the LLM-token cost-savings story is real end-to-end. Per-channel ring buffer (32-deep) supplies context-attach.
 - End-to-end integration test in `test/e2e/` proves the full path: chat → matcher → signed POST → verified payload with context.
 
-Slices 3b+ ahead (protocol verbs for subscription management, inbound integrations, chat history, federation, etc.): see [DESIGN.md](DESIGN.md#implementation-slices).
+- **Subscription verbs over the realtime protocol (slice 3b)**: `subscription_create` / `_list` / `_get` / `_update` / `_delete` on the JSON-line wire. Same business logic as REST via shared `internal/subops` package. End-to-end test exercises the full protocol path including HMAC verification of webhooks fired against a secret obtained over the protocol.
+
+Slices 4+ ahead (inbound integrations, chat history, federation, etc.): see [DESIGN.md](DESIGN.md#implementation-slices).
 
 Headline numbers from `go test -p 1 -run TestFanoutLatency -v ./test/bench/` on Apple Silicon:
 
@@ -77,6 +79,8 @@ prm/
     matcher/               # subscription match-rule compiler + evaluator (regex/glob/mention)
     webhook/               # outbound webhook delivery: HMAC signing + retry + debounce + cooldown + budget
     rest/                  # REST control plane: subscription CRUD on :8443
+    subops/                # shared business logic for subscription CRUD; called by both
+                           # rest/ (HTTP) and server/ (PRM-protocol verbs in slice 3b)
     rest/                  # HTTP control plane (account/channel/subscription/integration CRUD)
     webhook/               # subscription matcher, debounce buffer, signed HTTP POST worker pool
     inbound/               # inbound integration receiver: POST /v1/inbound/{id} handler + adapter registry

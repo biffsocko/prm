@@ -561,7 +561,11 @@ Slicing the build so each step ships something useful and validates the next:
 - `prmd serve` brings up the realtime listener, the REST control plane (optional `--rest-addr`), and the webhook manager (`Reload` then `Start`) as a single coordinated stack.
 - End-to-end integration test in `test/e2e/` exercises the entire stack: real chat message → matcher → signed POST → verified payload with context.
 
-Deferred from slice 3: protocol-verb equivalents for subscription management over the realtime port (slice 3b). REST is the curl-friendly path; verbs land later if there's demand from bot authors who want one socket.
+**Slice 3b — Subscription management over the realtime protocol. ✅ Implemented.**
+- New verbs on the PRM JSON-line protocol: `subscription_create` / `_list` / `_get` / `_update` / `_delete`, with `subscription_ok` / `_list_ok` / `_deleted` responses and the existing `error` frame for failures.
+- Token-authed bot connections can now manage subscriptions over the same TLS socket they use for chat — no separate HTTP client needed for serverless bots that already speak the PRM protocol.
+- REST and protocol paths share `internal/subops` for validation, channel resolution, secret generation, cross-account isolation, and webhook-manager updates so the two surfaces stay in lockstep.
+- End-to-end test in `test/e2e/subscriptions_proto_test.go` proves the round-trip: bot connects, token-auths, creates/lists/gets/updates/deletes subscriptions over the protocol, and the resulting subscription fires webhooks for real chat messages with HMAC signatures verifying against the secret obtained via the protocol response.
 
 **Slice 4 — Inbound integrations.**
 - `POST /v1/inbound/{integration_id}` endpoint

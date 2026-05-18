@@ -7,7 +7,10 @@
 // error.
 package proto
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Frame is anything that can be sent over the wire.
 type Frame interface {
@@ -16,20 +19,28 @@ type Frame interface {
 
 // Verb type constants.
 const (
-	TypeHello          = "hello"
-	TypeWelcome        = "welcome"
-	TypeAuthRequest    = "auth_request"
-	TypeAuthChallenge  = "auth_challenge"
-	TypeAuthResponse   = "auth_response"
-	TypeAuthOK         = "auth_ok"
-	TypeAuthErr        = "auth_err"
-	TypeJoin           = "join"
-	TypePart           = "part"
-	TypeMsg            = "msg"
-	TypePresence       = "presence"
-	TypePing           = "ping"
-	TypePong           = "pong"
-	TypeError          = "error"
+	TypeHello                = "hello"
+	TypeWelcome              = "welcome"
+	TypeAuthRequest          = "auth_request"
+	TypeAuthChallenge        = "auth_challenge"
+	TypeAuthResponse         = "auth_response"
+	TypeAuthOK               = "auth_ok"
+	TypeAuthErr              = "auth_err"
+	TypeJoin                 = "join"
+	TypePart                 = "part"
+	TypeMsg                  = "msg"
+	TypePresence             = "presence"
+	TypePing                 = "ping"
+	TypePong                 = "pong"
+	TypeError                = "error"
+	TypeSubscriptionCreate   = "subscription_create"
+	TypeSubscriptionList     = "subscription_list"
+	TypeSubscriptionGet      = "subscription_get"
+	TypeSubscriptionUpdate   = "subscription_update"
+	TypeSubscriptionDelete   = "subscription_delete"
+	TypeSubscriptionOK       = "subscription_ok"
+	TypeSubscriptionListOK   = "subscription_list_ok"
+	TypeSubscriptionDeleted  = "subscription_deleted"
 )
 
 // Auth methods.
@@ -193,6 +204,125 @@ type Pong struct {
 }
 
 func (Pong) FrameType() string { return TypePong }
+
+// --- Subscription management verbs (slice 3b) ---
+//
+// These mirror the REST control plane's subscription CRUD but live on the
+// realtime PRM protocol so a bot can manage subscriptions over the same
+// authenticated TLS socket it uses for chat. Auth is implicit via the
+// existing AuthOK on the connection; the connection's account must be a
+// bot.
+
+// SubscriptionInfo is the wire representation of a subscription. Returned
+// in subscription_ok and inside subscription_list_ok. The Secret field is
+// populated ONLY in the response to subscription_create -- never in get/list.
+type SubscriptionInfo struct {
+	ID           string          `json:"id"`
+	TenantID     string          `json:"tenant_id"`
+	AccountID    string          `json:"account_id"`
+	ChannelID    string          `json:"channel_id"`
+	URL          string          `json:"url"`
+	Secret       string          `json:"secret,omitempty"` // base64-url, returned once on create
+	Match        json.RawMessage `json:"match"`
+	Events       []string        `json:"events"`
+	ContextLines int             `json:"context_lines"`
+	DebounceMs   int             `json:"debounce_ms"`
+	CooldownMs   int             `json:"cooldown_ms"`
+	Budget       json.RawMessage `json:"budget,omitempty"`
+	DisabledAt   *time.Time      `json:"disabled_at,omitempty"`
+	CreatedAt    time.Time       `json:"created_at"`
+}
+
+// SubscriptionCreate asks the server to create a subscription on the
+// given channel. Exactly one of ChannelName or ChannelID must be set.
+type SubscriptionCreate struct {
+	Type         string          `json:"type"`
+	ID           string          `json:"id,omitempty"`
+	ChannelName  string          `json:"channel_name,omitempty"`
+	ChannelID    string          `json:"channel_id,omitempty"`
+	URL          string          `json:"url"`
+	Match        json.RawMessage `json:"match"`
+	Events       []string        `json:"events,omitempty"`
+	ContextLines int             `json:"context_lines,omitempty"`
+	DebounceMs   int             `json:"debounce_ms,omitempty"`
+	CooldownMs   int             `json:"cooldown_ms,omitempty"`
+	Budget       json.RawMessage `json:"budget,omitempty"`
+}
+
+func (SubscriptionCreate) FrameType() string { return TypeSubscriptionCreate }
+
+// SubscriptionList asks the server to return all subscriptions owned by
+// the connection's account in the connection's tenant.
+type SubscriptionList struct {
+	Type string `json:"type"`
+	ID   string `json:"id,omitempty"`
+}
+
+func (SubscriptionList) FrameType() string { return TypeSubscriptionList }
+
+// SubscriptionGet fetches one subscription by ID.
+type SubscriptionGet struct {
+	Type           string `json:"type"`
+	ID             string `json:"id,omitempty"`
+	SubscriptionID string `json:"subscription_id"`
+}
+
+func (SubscriptionGet) FrameType() string { return TypeSubscriptionGet }
+
+// SubscriptionUpdate patches a subscription. Pointers for primitive
+// fields so absent fields can be distinguished from zero-valued ones on
+// the wire.
+type SubscriptionUpdate struct {
+	Type           string          `json:"type"`
+	ID             string          `json:"id,omitempty"`
+	SubscriptionID string          `json:"subscription_id"`
+	URL            *string         `json:"url,omitempty"`
+	Match          json.RawMessage `json:"match,omitempty"`
+	Events         []string        `json:"events,omitempty"`
+	ContextLines   *int            `json:"context_lines,omitempty"`
+	DebounceMs     *int            `json:"debounce_ms,omitempty"`
+	CooldownMs     *int            `json:"cooldown_ms,omitempty"`
+	Budget         json.RawMessage `json:"budget,omitempty"`
+	Disabled       *bool           `json:"disabled,omitempty"`
+}
+
+func (SubscriptionUpdate) FrameType() string { return TypeSubscriptionUpdate }
+
+// SubscriptionDelete removes a subscription.
+type SubscriptionDelete struct {
+	Type           string `json:"type"`
+	ID             string `json:"id,omitempty"`
+	SubscriptionID string `json:"subscription_id"`
+}
+
+func (SubscriptionDelete) FrameType() string { return TypeSubscriptionDelete }
+
+// SubscriptionOK is the server's response to create / get / update.
+type SubscriptionOK struct {
+	Type         string           `json:"type"`
+	ID           string           `json:"id,omitempty"`
+	Subscription SubscriptionInfo `json:"subscription"`
+}
+
+func (SubscriptionOK) FrameType() string { return TypeSubscriptionOK }
+
+// SubscriptionListOK is the server's response to list.
+type SubscriptionListOK struct {
+	Type          string             `json:"type"`
+	ID            string             `json:"id,omitempty"`
+	Subscriptions []SubscriptionInfo `json:"subscriptions"`
+}
+
+func (SubscriptionListOK) FrameType() string { return TypeSubscriptionListOK }
+
+// SubscriptionDeleted is the server's response to delete.
+type SubscriptionDeleted struct {
+	Type           string `json:"type"`
+	ID             string `json:"id,omitempty"`
+	SubscriptionID string `json:"subscription_id"`
+}
+
+func (SubscriptionDeleted) FrameType() string { return TypeSubscriptionDeleted }
 
 // Error is the generic error frame. Reason is a stable machine-readable code
 // (e.g., "not_authenticated", "channel_not_found", "rate_limited"); Detail

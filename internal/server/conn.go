@@ -214,8 +214,18 @@ func (c *Conn) dispatch(ctx context.Context, f proto.Frame) {
 		c.handlePing(v)
 	case proto.Pong:
 		c.handlePong(v)
+	case proto.SubscriptionCreate:
+		c.handleSubscriptionCreate(ctx, v)
+	case proto.SubscriptionList:
+		c.handleSubscriptionList(ctx, v)
+	case proto.SubscriptionGet:
+		c.handleSubscriptionGet(ctx, v)
+	case proto.SubscriptionUpdate:
+		c.handleSubscriptionUpdate(ctx, v)
+	case proto.SubscriptionDelete:
+		c.handleSubscriptionDelete(ctx, v)
 	default:
-		c.sendError("unsupported", fmt.Sprintf("verb %q not supported in slice 1", f.FrameType()), "")
+		c.sendError("unsupported", fmt.Sprintf("verb %q not supported", f.FrameType()), "")
 	}
 }
 

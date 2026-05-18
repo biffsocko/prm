@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -34,6 +33,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/biffsocko/prm/internal/storage"
+	"github.com/biffsocko/prm/internal/subops"
 	"github.com/biffsocko/prm/internal/webhook"
 )
 
@@ -283,86 +283,20 @@ func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
 		return
 	}
-	if req.URL == "" {
-		writeError(w, http.StatusBadRequest, "missing_url", "url is required")
-		return
-	}
-	if len(req.Match) == 0 {
-		writeError(w, http.StatusBadRequest, "missing_match", "match rules are required")
-		return
-	}
-	if (req.ChannelName == "") == (req.ChannelID == "") {
-		writeError(w, http.StatusBadRequest, "channel_required", "exactly one of channel_name or channel_id is required")
-		return
-	}
-
-	// Resolve channel.
-	var channelID uuid.UUID
-	if req.ChannelID != "" {
-		id, err := uuid.Parse(req.ChannelID)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "bad_channel_id", err.Error())
-			return
-		}
-		ch, err := s.cfg.Store.GetChannelByID(r.Context(), tenant.ID, id)
-		if err != nil {
-			writeError(w, http.StatusNotFound, "channel_not_found", "no such channel in this tenant")
-			return
-		}
-		channelID = ch.ID
-	} else {
-		ch, err := s.cfg.Store.GetChannelByName(r.Context(), tenant.ID, req.ChannelName)
-		if err != nil {
-			writeError(w, http.StatusNotFound, "channel_not_found", "no such channel in this tenant")
-			return
-		}
-		channelID = ch.ID
-	}
-
-	// Validate match rules by compiling them; reject on bad rules.
-	if err := validateMatch(req.Match); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_match", err.Error())
-		return
-	}
-
-	// Generate a fresh HMAC secret. 32 bytes of crypto/rand, raw bytes.
-	// Returned to the caller base64-url-encoded; stored as raw bytes in
-	// the subscription row.
-	secret := make([]byte, 32)
-	if _, err := rand.Read(secret); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "secret generation failed")
-		return
-	}
-
-	events := req.Events
-	if len(events) == 0 {
-		events = []string{"message"}
-	}
-	budgetJSON := req.Budget
-	if len(budgetJSON) == 0 {
-		budgetJSON = []byte("{}")
-	}
-
-	sub := &storage.Subscription{
-		AccountID:    bot.ID,
-		ChannelID:    channelID,
+	sub, err := subops.Create(r.Context(), s.cfg.Store, s.cfg.WebhookMgr, tenant, bot, subops.CreateInput{
+		ChannelName:  req.ChannelName,
+		ChannelID:    req.ChannelID,
 		URL:          req.URL,
-		Secret:       secret,
-		MatchJSON:    []byte(req.Match),
-		Events:       events,
+		Match:        []byte(req.Match),
+		Events:       req.Events,
 		ContextLines: req.ContextLines,
 		DebounceMs:   req.DebounceMs,
 		CooldownMs:   req.CooldownMs,
-		BudgetJSON:   []byte(budgetJSON),
-	}
-	if err := s.cfg.Store.CreateSubscription(r.Context(), tenant.ID, sub); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		Budget:       []byte(req.Budget),
+	})
+	if err != nil {
+		writeSubopsError(w, err)
 		return
-	}
-	if s.cfg.WebhookMgr != nil {
-		if err := s.cfg.WebhookMgr.AddOrUpdate(sub); err != nil {
-			s.log.Warn("webhook manager add-or-update failed", "err", err)
-		}
 	}
 	_ = writeJSON(w, http.StatusCreated, toResponse(sub, true))
 }
@@ -370,9 +304,9 @@ func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request
 func (s *Server) handleListSubscriptions(w http.ResponseWriter, r *http.Request) {
 	bot := callerAccount(r)
 	tenant := callerTenant(r)
-	list, err := s.cfg.Store.ListSubscriptionsByAccount(r.Context(), tenant.ID, bot.ID)
+	list, err := subops.List(r.Context(), s.cfg.Store, tenant, bot)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		writeSubopsError(w, err)
 		return
 	}
 	out := make([]subscriptionResponse, 0, len(list))
@@ -385,20 +319,9 @@ func (s *Server) handleListSubscriptions(w http.ResponseWriter, r *http.Request)
 func (s *Server) handleGetSubscription(w http.ResponseWriter, r *http.Request) {
 	bot := callerAccount(r)
 	tenant := callerTenant(r)
-	id, err := uuid.Parse(r.PathValue("id"))
+	sub, err := subops.Get(r.Context(), s.cfg.Store, tenant, bot, r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_id", err.Error())
-		return
-	}
-	sub, err := s.cfg.Store.GetSubscriptionByID(r.Context(), tenant.ID, id)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "not_found", "")
-		return
-	}
-	if sub.AccountID != bot.ID {
-		// Tenant-isolated but not account-isolated by default; refuse
-		// cross-account access from a bot.
-		writeError(w, http.StatusForbidden, "not_owner", "subscription belongs to a different account")
+		writeSubopsError(w, err)
 		return
 	}
 	_ = writeJSON(w, http.StatusOK, toResponse(sub, false))
@@ -420,71 +343,33 @@ type updateSubscriptionRequest struct {
 func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request) {
 	bot := callerAccount(r)
 	tenant := callerTenant(r)
-	id, err := uuid.Parse(r.PathValue("id"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_id", err.Error())
-		return
-	}
 	var req updateSubscriptionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
 		return
 	}
-	sub, err := s.cfg.Store.GetSubscriptionByID(r.Context(), tenant.ID, id)
+	in := subops.UpdateInput{
+		URL:          req.URL,
+		Match:        []byte(req.Match),
+		Events:       req.Events,
+		ContextLines: req.ContextLines,
+		DebounceMs:   req.DebounceMs,
+		CooldownMs:   req.CooldownMs,
+		Budget:       []byte(req.Budget),
+		Disabled:     req.Disabled,
+	}
+	// subops treats nil slice as "no change"; json.RawMessage of length 0
+	// becomes an empty []byte which we want to round-trip as nil.
+	if len(req.Match) == 0 {
+		in.Match = nil
+	}
+	if len(req.Budget) == 0 {
+		in.Budget = nil
+	}
+	sub, err := subops.Update(r.Context(), s.cfg.Store, s.cfg.WebhookMgr, tenant, bot, r.PathValue("id"), in)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "not_found", "")
+		writeSubopsError(w, err)
 		return
-	}
-	if sub.AccountID != bot.ID {
-		writeError(w, http.StatusForbidden, "not_owner", "subscription belongs to a different account")
-		return
-	}
-	if req.URL != nil {
-		sub.URL = *req.URL
-	}
-	if req.Match != nil {
-		if err := validateMatch(req.Match); err != nil {
-			writeError(w, http.StatusBadRequest, "bad_match", err.Error())
-			return
-		}
-		sub.MatchJSON = []byte(req.Match)
-	}
-	if req.Events != nil {
-		sub.Events = req.Events
-	}
-	if req.ContextLines != nil {
-		sub.ContextLines = *req.ContextLines
-	}
-	if req.DebounceMs != nil {
-		sub.DebounceMs = *req.DebounceMs
-	}
-	if req.CooldownMs != nil {
-		sub.CooldownMs = *req.CooldownMs
-	}
-	if req.Budget != nil {
-		sub.BudgetJSON = []byte(req.Budget)
-	}
-	if req.Disabled != nil {
-		if *req.Disabled {
-			if sub.DisabledAt.IsZero() {
-				sub.DisabledAt = time.Now().UTC()
-			}
-		} else {
-			sub.DisabledAt = time.Time{}
-		}
-	}
-	if err := s.cfg.Store.UpdateSubscription(r.Context(), tenant.ID, sub); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", err.Error())
-		return
-	}
-	if s.cfg.WebhookMgr != nil {
-		if sub.DisabledAt.IsZero() {
-			if err := s.cfg.WebhookMgr.AddOrUpdate(sub); err != nil {
-				s.log.Warn("webhook manager refresh failed", "err", err)
-			}
-		} else {
-			s.cfg.WebhookMgr.Remove(sub.ID)
-		}
 	}
 	_ = writeJSON(w, http.StatusOK, toResponse(sub, false))
 }
@@ -492,28 +377,25 @@ func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request
 func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request) {
 	bot := callerAccount(r)
 	tenant := callerTenant(r)
-	id, err := uuid.Parse(r.PathValue("id"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_id", err.Error())
+	if err := subops.Delete(r.Context(), s.cfg.Store, s.cfg.WebhookMgr, tenant, bot, r.PathValue("id")); err != nil {
+		writeSubopsError(w, err)
 		return
-	}
-	sub, err := s.cfg.Store.GetSubscriptionByID(r.Context(), tenant.ID, id)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "not_found", "")
-		return
-	}
-	if sub.AccountID != bot.ID {
-		writeError(w, http.StatusForbidden, "not_owner", "subscription belongs to a different account")
-		return
-	}
-	if err := s.cfg.Store.DeleteSubscription(r.Context(), tenant.ID, id); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", err.Error())
-		return
-	}
-	if s.cfg.WebhookMgr != nil {
-		s.cfg.WebhookMgr.Remove(id)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeSubopsError maps subops.Err* sentinels to HTTP status codes.
+func writeSubopsError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, subops.ErrBadRequest):
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+	case errors.Is(err, subops.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, subops.ErrNotOwner):
+		writeError(w, http.StatusForbidden, "not_owner", err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+	}
 }
 
 // --- helpers ---
