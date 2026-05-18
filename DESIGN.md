@@ -550,12 +550,18 @@ Slicing the build so each step ships something useful and validates the next:
 - Documented restore runbook in `docs/HA.md` covering Tier 2 topology, failover sequence, restore-from-backup, monthly restore-test discipline.
 - Reconnect logic in TUI client with exponential backoff (1s → 30s capped). Essential under HA failover (10–30s blip).
 
-**Slice 3 — Webhook subscriptions + outbound delivery.**
-- REST control plane subscription CRUD
-- Subscription matcher (regex/glob/mention)
-- Debounce window, cooldown, budget caps
-- Signed HMAC HTTP POST worker pool with retry policy
-- Context-attach (last N channel messages bundled into payload)
+**Slice 3 — Webhook subscriptions + outbound delivery. ✅ Implemented.**
+- REST control plane (TLS, port 8443 default): subscription CRUD with bearer-token auth, plaintext HMAC secret returned exactly once at create. `/healthz` for L4 LB probes.
+- Subscription matcher (`internal/matcher`): regex / glob / mention; compile-once, evaluate-many; `any_of` (OR), `all_of` (AND), combined semantics. Compile validates so bad regex fails at create time, not at first fire.
+- Per-channel ring buffer (`internal/channels`, 32-deep default) for context-attach: snapshot taken before the broadcast hot path appends the current message, so context = preceding messages.
+- Webhook worker pool (`internal/webhook`): fixed-size goroutine pool, bounded queue, HMAC-SHA256 signed POSTs with `PRM-Signature: t=<unix>,v1=<hex>` header (replay-safe timestamp prefix), retry policy (250ms→500ms→1s exponential backoff on 5xx/timeouts, max 3 attempts; 4xx dropped without retry; auto-disable after 5 consecutive 4xx).
+- Debounce + cooldown + daily budget caps per subscription. Budget counter excludes failed/dropped fires.
+- Every fire (ok or failed) recorded in `subscription_fires` for accounting + audit.
+- Server's broadcast path calls `WebhookMgr.Notify` after the chat fan-out completes — non-blocking; webhook delivery is on the worker pool and never blocks chat.
+- `prmd serve` brings up the realtime listener, the REST control plane (optional `--rest-addr`), and the webhook manager (`Reload` then `Start`) as a single coordinated stack.
+- End-to-end integration test in `test/e2e/` exercises the entire stack: real chat message → matcher → signed POST → verified payload with context.
+
+Deferred from slice 3: protocol-verb equivalents for subscription management over the realtime port (slice 3b). REST is the curl-friendly path; verbs land later if there's demand from bot authors who want one socket.
 
 **Slice 4 — Inbound integrations.**
 - `POST /v1/inbound/{integration_id}` endpoint

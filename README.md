@@ -2,7 +2,7 @@
 
 A high-speed, auth-required chat relay built for LLM-powered bots as first-class citizens. Similar shape to IRC — server, channels, identities, private messages — but a fresh wire protocol and modern primitives throughout.
 
-**Status:** slices 1 and 2 implemented. Real TLS server, password + token auth, multi-tenant from day one, explicit channels with ACL enforcement, bot accounts with API tokens, TUI client with reconnect-on-disconnect, hot-standby HA pattern with documented operator runbook. Sub-ms p50 fan-out hit on the included benchmark. See [DESIGN.md](DESIGN.md#implementation-slices) for the full slice plan and what's deferred to slices 3+.
+**Status:** slices 1, 2, and 3 implemented. Real TLS server, password + token auth, multi-tenant from day one, explicit channels with ACL enforcement, bot accounts with API tokens, TUI client with reconnect, hot-standby HA pattern with operator runbook, and **the headline value-prop layer: webhook subscriptions with server-side filter pushdown, debounce + cooldown + budget caps, HMAC-signed POSTs, and context-attach**. End-to-end test stands up the full stack (realtime + REST + webhook manager + fake bot) and verifies a chat message triggers a signed webhook with preceding messages attached. Sub-ms p50 fan-out preserved. See [DESIGN.md](DESIGN.md#implementation-slices) for the full slice plan.
 
 ## Try it locally
 
@@ -21,7 +21,7 @@ go build ./...
 ./prmd admin grant --storage sqlite:./prm.db acme private-room alertbot member
 
 # issue a bot API token (printed once)
-./prmd admin issue-token --storage sqlite:./prm.db --label primary acme alertbot
+TOKEN=$(./prmd admin issue-token --storage sqlite:./prm.db --label primary acme alertbot | awk '/TOKEN:/{print $2}')
 
 # start the server (dev mode = self-signed cert for localhost)
 ./prmd admin generate-cert --out-dir ./certs localhost
@@ -31,7 +31,23 @@ go build ./...
 PRM_PASSWORD=hunter2 ./prm --insecure localhost:6697 acme alex general
 
 # connect as a bot (token)
-./prm --insecure --token "<token-from-issue-token>" localhost:6697 acme alertbot private-room
+./prm --insecure --token "$TOKEN" localhost:6697 acme alertbot private-room
+
+# create a webhook subscription (REST control plane on :8443)
+curl -k -X POST https://localhost:8443/v1/subscriptions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "channel_name": "general",
+    "url": "https://my-bot.example.com/prm-webhook",
+    "match": {"any_of":[{"type":"regex","pattern":"(?i)^deploy"}]},
+    "context_lines": 8,
+    "debounce_ms": 500,
+    "cooldown_ms": 5000,
+    "budget": {"daily_max_fires": 500}
+  }'
+# The 201 response includes a one-time "secret" -- use it to verify the
+# HMAC on incoming webhook POSTs in your bot's handler.
 ```
 
 ## Benchmark numbers (slice 1, single laptop, Apple Silicon)
