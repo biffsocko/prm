@@ -94,15 +94,24 @@ type Channel struct {
 type ChannelRole string
 
 const (
-	RoleOwner  ChannelRole = "owner"
-	RoleAdmin  ChannelRole = "admin"
-	RoleMember ChannelRole = "member"
-	RoleBanned ChannelRole = "banned"
+	RoleOwner     ChannelRole = "owner"
+	RoleAdmin     ChannelRole = "admin"
+	RoleMember    ChannelRole = "member"
+	RoleBanned    ChannelRole = "banned"
+	RoleChannelOp ChannelRole = "channel_op"
 )
 
 // CanJoin reports whether the role permits joining the channel.
 func (r ChannelRole) CanJoin() bool {
-	return r == RoleOwner || r == RoleAdmin || r == RoleMember
+	return r == RoleOwner || r == RoleAdmin || r == RoleMember || r == RoleChannelOp
+}
+
+// CanModerate reports whether the role permits channel-operator actions
+// (pause a bot, freeze the channel in future slices, kick, etc.). Owners
+// and admins also moderate; the dedicated RoleChannelOp exists so an
+// account can be granted moderation without ownership.
+func (r ChannelRole) CanModerate() bool {
+	return r == RoleOwner || r == RoleAdmin || r == RoleChannelOp
 }
 
 // ChannelACLEntry is one row of a channel's access control list.
@@ -193,6 +202,43 @@ type Integration struct {
 	CreatedAt    time.Time
 }
 
+// ChannelBotPause is a channel-operator-issued halt on one bot's webhook
+// deliveries in one channel. The bot's subscriptions still MATCH incoming
+// messages, but deliveries are suppressed while the pause row exists —
+// this stops the bot's ACTIONS without cutting off its ability to observe
+// via a live realtime connection. Cleared by RemoveChannelBotPause.
+type ChannelBotPause struct {
+	TenantID     uuid.UUID
+	ChannelID    uuid.UUID
+	BotAccountID uuid.UUID
+	PausedBy     uuid.UUID // the channel_op account that issued the pause
+	PausedAt     time.Time
+	Reason       string
+}
+
+// ModerationAction names one channel-operator action for the audit log.
+type ModerationAction string
+
+const (
+	ModActionPauseBot  ModerationAction = "pause_bot"
+	ModActionResumeBot ModerationAction = "resume_bot"
+)
+
+// ModerationEvent is one row of the append-only channel_moderation_events
+// audit log. Every channel-operator action produces exactly one row plus a
+// visible system message in the channel — this is the audit trail the
+// operator's actions leave behind.
+type ModerationEvent struct {
+	ID        uuid.UUID
+	TenantID  uuid.UUID
+	ChannelID uuid.UUID
+	ActorID   uuid.UUID // the channel_op account
+	TargetID  uuid.UUID // bot account (for pause/resume); may be zero for whole-channel actions
+	Action    ModerationAction
+	Reason    string
+	At        time.Time
+}
+
 // Token is an API token issued to a bot account. The plaintext token is
 // shown to the user exactly once at issuance; only the SHA-256 hash is
 // stored. Lookup is by hash (the server hashes the bearer token on auth
@@ -278,4 +324,18 @@ type Store interface {
 	RecordMessage(ctx context.Context, msg *StoredMessage) error
 	ListMessages(ctx context.Context, tenantID, channelID uuid.UUID, limit int, beforeTS time.Time) ([]*StoredMessage, error)
 	PurgeMessagesOlderThan(ctx context.Context, retention time.Duration) (int, error)
+
+	// Channel-operator moderation state (slice 6a).
+	// SetChannelBotPause upserts a pause row; RemoveChannelBotPause deletes
+	// it. ListChannelBotPauses returns every pause in the tenant so the
+	// webhook manager can rebuild its in-memory pause set on startup.
+	SetChannelBotPause(ctx context.Context, p *ChannelBotPause) error
+	RemoveChannelBotPause(ctx context.Context, tenantID, channelID, botAccountID uuid.UUID) error
+	ListChannelBotPauses(ctx context.Context, tenantID uuid.UUID) ([]*ChannelBotPause, error)
+
+	// Moderation audit log — append-only. RecordModerationEvent stamps ID
+	// and At if unset. ListModerationEvents returns events in a channel,
+	// newest-first, up to limit (default 50, cap 500).
+	RecordModerationEvent(ctx context.Context, ev *ModerationEvent) error
+	ListModerationEvents(ctx context.Context, tenantID, channelID uuid.UUID, limit int) ([]*ModerationEvent, error)
 }

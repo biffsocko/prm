@@ -45,6 +45,17 @@ const (
 	TypeChatHistoryOK        = "chathistory_ok"
 	TypeMembers              = "members"
 	TypeMembersOK            = "members_ok"
+	TypeChanopPauseBot       = "chanop_pause_bot"
+	TypeChanopResumeBot      = "chanop_resume_bot"
+	TypeChanopOK             = "chanop_ok"
+)
+
+// Sender roles that may be stamped on outbound Msg frames so clients can
+// render distinguishing badges (e.g., an [op] prefix on operator
+// messages). Empty means "regular member."
+const (
+	FromRoleChannelOp = "channel_op"
+	FromRoleSystem    = "system"
 )
 
 // Auth methods.
@@ -167,14 +178,19 @@ func (Part) FrameType() string { return TypePart }
 //
 // Outbound from client: From is empty (server stamps it). TS is empty.
 // Outbound from server (broadcast): From and TS are set by the server.
+// FromRole, if non-empty, tags the sender's channel role so clients can
+// render distinguishing badges — e.g., "channel_op" for operator-authored
+// messages, "system" for server-generated moderation notices. Empty for
+// regular member messages.
 type Msg struct {
-	Type    string    `json:"type"`
-	ID      string    `json:"id,omitempty"`
-	Channel string    `json:"channel,omitempty"` // empty for direct messages
-	To      string    `json:"to,omitempty"`      // account_id for direct messages
-	From    string    `json:"from,omitempty"`    // account_id (server-stamped)
-	TS      time.Time `json:"ts,omitempty"`      // server-stamped
-	Body    string    `json:"body"`
+	Type     string    `json:"type"`
+	ID       string    `json:"id,omitempty"`
+	Channel  string    `json:"channel,omitempty"` // empty for direct messages
+	To       string    `json:"to,omitempty"`      // account_id for direct messages
+	From     string    `json:"from,omitempty"`    // account_id (server-stamped)
+	FromRole string    `json:"from_role,omitempty"`
+	TS       time.Time `json:"ts,omitempty"` // server-stamped
+	Body     string    `json:"body"`
 }
 
 func (Msg) FrameType() string { return TypeMsg }
@@ -393,6 +409,11 @@ type MemberInfo struct {
 	AccountType string `json:"account_type"` // "human" | "bot"
 	IsGhost     bool   `json:"is_ghost"`
 	ConnCount   int    `json:"conn_count"`
+	// Paused is true when a channel operator has suspended this bot's
+	// webhook deliveries on this channel (slice 6a). Always false for
+	// human rows. Consumers use this to render a [paused] badge in the
+	// roster so operators can see current state at a glance.
+	Paused bool `json:"paused,omitempty"`
 }
 
 // MembersOK is the server's response to a Members request.
@@ -404,6 +425,57 @@ type MembersOK struct {
 }
 
 func (MembersOK) FrameType() string { return TypeMembersOK }
+
+// --- Channel-operator verbs (slice 6a) ---
+//
+// These let a caller with RoleChannelOp (or Owner/Admin) on a channel take
+// moderation actions. Slice 6a ships pause/resume for a bot's webhook
+// deliveries on the channel; future slices will add freeze / kick / delete.
+//
+// The server's canonical response is ChanopOK on success; failures go
+// through the standard Error frame.
+
+// ChanopPauseBot suspends one bot's webhook deliveries on the channel.
+// The bot's subscriptions still MATCH incoming messages, but no HTTP /
+// AMQP / MQTT delivery fires until the pause is lifted. Effect is
+// per-channel — a bot may be paused in one channel and active in
+// another. Emits a system message in the channel and writes a
+// channel_moderation_events row.
+type ChanopPauseBot struct {
+	Type         string `json:"type"`
+	ID           string `json:"id,omitempty"`
+	Channel      string `json:"channel"`
+	BotAccountID string `json:"bot_account_id"`
+	Reason       string `json:"reason,omitempty"`
+}
+
+func (ChanopPauseBot) FrameType() string { return TypeChanopPauseBot }
+
+// ChanopResumeBot lifts a previous pause. Idempotent — resuming a
+// non-paused bot is a no-op that still emits the system message so the
+// channel record is consistent.
+type ChanopResumeBot struct {
+	Type         string `json:"type"`
+	ID           string `json:"id,omitempty"`
+	Channel      string `json:"channel"`
+	BotAccountID string `json:"bot_account_id"`
+	Reason       string `json:"reason,omitempty"`
+}
+
+func (ChanopResumeBot) FrameType() string { return TypeChanopResumeBot }
+
+// ChanopOK is the success response to a channel-operator verb. Action is
+// the verb name that succeeded ("pause_bot" | "resume_bot") so a single
+// response type can carry multiple verb outcomes.
+type ChanopOK struct {
+	Type         string `json:"type"`
+	ID           string `json:"id,omitempty"`
+	Action       string `json:"action"`
+	Channel      string `json:"channel"`
+	BotAccountID string `json:"bot_account_id,omitempty"`
+}
+
+func (ChanopOK) FrameType() string { return TypeChanopOK }
 
 // Error is the generic error frame. Reason is a stable machine-readable code
 // (e.g., "not_authenticated", "channel_not_found", "rate_limited"); Detail

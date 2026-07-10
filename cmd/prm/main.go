@@ -37,11 +37,12 @@ func main() {
 	insecure := fs.Bool("insecure", false, "skip TLS verification (for dev self-signed certs)")
 	token := fs.String("token", "", "use token-method auth instead of password (overrides password)")
 	displayName := fs.String("display-name", "", "(unused in slice 1; reserved)")
+	opMode := fs.Bool("op", false, "channel-operator mode: right-pane roster with paused-bot badges; press 'p' to pause/resume the selected bot")
 	_ = displayName
 	_ = fs.Parse(os.Args[1:])
 
 	if fs.NArg() != 4 {
-		fmt.Fprintln(os.Stderr, "usage: prm [--insecure] [--token TOKEN] <server-addr> <tenant> <username> <channel>")
+		fmt.Fprintln(os.Stderr, "usage: prm [--insecure] [--token TOKEN] [--op] <server-addr> <tenant> <username> <channel>")
 		os.Exit(2)
 	}
 	addr := fs.Arg(0)
@@ -56,6 +57,7 @@ func main() {
 		channel:  channel,
 		token:    *token,
 		insecure: *insecure,
+		opMode:   *opMode,
 	}
 	if creds.token == "" {
 		password := os.Getenv("PRM_PASSWORD")
@@ -101,6 +103,7 @@ type credentials struct {
 	password string // empty if using token
 	token    string // empty if using password
 	insecure bool
+	opMode   bool // enables channel-operator UI (roster + pause verb)
 }
 
 func (c credentials) tlsConfig() *tls.Config {
@@ -239,9 +242,13 @@ func (c *prmClient) pumpInto(p *tea.Program) {
 		case proto.Ping:
 			_ = c.send(proto.Pong{Token: v.Token})
 		case proto.Msg:
-			p.Send(chatMsg{from: v.From, body: v.Body, ts: v.TS})
+			p.Send(chatMsg{from: v.From, fromRole: v.FromRole, body: v.Body, ts: v.TS})
 		case proto.Presence:
 			p.Send(presenceMsg{kind: v.Kind, displayName: v.DisplayName, accountID: v.AccountID})
+		case proto.MembersOK:
+			p.Send(membersMsg{members: v.Members})
+		case proto.ChanopOK:
+			p.Send(chanopOKMsg{action: v.Action, botAccountID: v.BotAccountID})
 		case proto.Error:
 			p.Send(serverErrorMsg{reason: v.Reason, detail: v.Detail})
 		}
@@ -251,9 +258,10 @@ func (c *prmClient) pumpInto(p *tea.Program) {
 // ---------- tea messages ----------
 
 type chatMsg struct {
-	from string
-	body string
-	ts   time.Time
+	from     string
+	fromRole string
+	body     string
+	ts       time.Time
 }
 
 type presenceMsg struct {
@@ -262,12 +270,25 @@ type presenceMsg struct {
 	accountID   string
 }
 
+type membersMsg struct {
+	members []proto.MemberInfo
+}
+
+type chanopOKMsg struct {
+	action       string
+	botAccountID string
+}
+
 type serverErrorMsg struct {
 	reason string
 	detail string
 }
 
 type disconnectMsg struct{ err error }
+
+// membersTick is emitted on a timer to trigger periodic roster refresh
+// while in operator mode. Ignored outside op mode.
+type membersTick struct{}
 
 // ---------- tea model ----------
 
@@ -287,15 +308,27 @@ type model struct {
 	reconnecting bool
 	reconnectN   int // attempt number, starts at 1
 	prog         *tea.Program // set after newProgram so reconnect goroutines can Send
+
+	// Op-mode roster state. Empty / unused outside op mode.
+	members       []proto.MemberInfo
+	rosterCursor  int // index into members; only bot rows are actionable
 }
 
 var (
-	systemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
-	selfStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
-	otherStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	tsStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	systemStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
+	selfStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
+	otherStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	tsStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	errStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	opStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("201")).Bold(true)
+	rosterBox      = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), false, false, false, true).PaddingLeft(1)
+	rosterCursorSt = lipgloss.NewStyle().Reverse(true)
+	pausedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	botStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
 )
+
+// membersRefreshInterval is how often op mode re-requests the roster.
+const membersRefreshInterval = 5 * time.Second
 
 func newModel(c *prmClient, creds credentials) *model {
 	ti := textinput.New()
@@ -312,6 +345,19 @@ func (m *model) Init() tea.Cmd {
 	return func() tea.Msg {
 		_ = m.cli.send(proto.Join{Channel: m.creds.channel})
 		return joinedMsg{}
+	}
+}
+
+// scheduleMembersTick returns a tea.Cmd that fires membersRefreshInterval
+// later; the Update handler answers by sending a Members request and
+// re-scheduling. No-op outside op mode.
+func (m *model) scheduleMembersTick() tea.Cmd {
+	if !m.creds.opMode {
+		return nil
+	}
+	return func() tea.Msg {
+		time.Sleep(membersRefreshInterval)
+		return membersTick{}
 	}
 }
 
@@ -356,11 +402,40 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.appendLine(errStyle.Render("send: " + err.Error()))
 				}
 			}
+		default:
+			// Op-mode keybindings on non-Enter keys. Only active while
+			// op mode is on and only for keys that don't collide with
+			// normal typing (bare letters WOULD collide; we bind to
+			// runes that arrive via KeyRunes and only act when the
+			// input is empty so a chatting operator can still type "p"
+			// in a message).
+			if m.creds.opMode && m.input.Value() == "" {
+				switch msg.String() {
+				case "p":
+					m.togglePauseSelected()
+				case "up", "k":
+					if m.rosterCursor > 0 {
+						m.rosterCursor--
+					}
+				case "down", "j":
+					if m.rosterCursor < len(m.members)-1 {
+						m.rosterCursor++
+					}
+				case "r":
+					// Manual roster refresh.
+					_ = m.cli.send(proto.Members{Channel: m.creds.channel})
+				}
+			}
 		}
 
 	case joinedMsg:
 		m.joined = true
 		m.appendLine(systemStyle.Render(fmt.Sprintf("** joined #%s **", m.creds.channel)))
+		// In op mode, kick off the initial roster fetch + tick loop.
+		if m.creds.opMode {
+			_ = m.cli.send(proto.Members{Channel: m.creds.channel})
+			cmds = append(cmds, m.scheduleMembersTick())
+		}
 
 	case chatMsg:
 		ts := msg.ts.Local().Format("15:04:05")
@@ -372,10 +447,36 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.from == m.cli.accountID {
 			style = selfStyle
 		}
-		m.appendLine(fmt.Sprintf("%s %s: %s",
+		// Operator-authored messages get an [op] prefix in a distinct
+		// color so channel members can see who was speaking with
+		// authority.
+		prefix := ""
+		if msg.fromRole == proto.FromRoleChannelOp {
+			prefix = opStyle.Render("[op] ")
+			style = opStyle
+		}
+		m.appendLine(fmt.Sprintf("%s %s%s: %s",
 			tsStyle.Render(ts),
+			prefix,
 			style.Render(displayShort(name)),
 			msg.body))
+
+	case membersMsg:
+		m.members = msg.members
+		if m.rosterCursor >= len(m.members) {
+			m.rosterCursor = 0
+		}
+
+	case membersTick:
+		if m.creds.opMode {
+			_ = m.cli.send(proto.Members{Channel: m.creds.channel})
+			cmds = append(cmds, m.scheduleMembersTick())
+		}
+
+	case chanopOKMsg:
+		// Optimistic UI: also request a fresh roster right away so the
+		// [paused] badge flips without waiting for the 5s tick.
+		_ = m.cli.send(proto.Members{Channel: m.creds.channel})
 
 	case presenceMsg:
 		kind := "joined"
@@ -461,6 +562,34 @@ func backoffFor(attempt int) time.Duration {
 	return d
 }
 
+// togglePauseSelected sends chanop_pause_bot or chanop_resume_bot for the
+// currently-highlighted roster row. No-op when the cursor is on a human
+// or when the roster is empty. The chanop_ok reply triggers a roster
+// refresh so the [paused] badge updates.
+func (m *model) togglePauseSelected() {
+	if m.rosterCursor < 0 || m.rosterCursor >= len(m.members) {
+		return
+	}
+	mem := m.members[m.rosterCursor]
+	if mem.AccountType != "bot" {
+		m.appendLine(errStyle.Render("op: selected row is not a bot"))
+		return
+	}
+	if mem.Paused {
+		_ = m.cli.send(proto.ChanopResumeBot{
+			Channel:      m.creds.channel,
+			BotAccountID: mem.AccountID,
+			Reason:       "resumed via TUI",
+		})
+	} else {
+		_ = m.cli.send(proto.ChanopPauseBot{
+			Channel:      m.creds.channel,
+			BotAccountID: mem.AccountID,
+			Reason:       "paused via TUI",
+		})
+	}
+}
+
 func (m *model) appendLine(line string) {
 	m.lines = append(m.lines, line)
 	if len(m.lines) > 2000 {
@@ -475,8 +604,66 @@ func (m *model) View() string {
 	if m.reconnecting {
 		connState = errStyle.Render(fmt.Sprintf(" -- RECONNECTING (attempt %d)", m.reconnectN))
 	}
-	status := systemStyle.Render(fmt.Sprintf("#%s -- %s -- Ctrl-C to quit", m.creds.channel, m.myName)) + connState
-	return fmt.Sprintf("%s\n%s\n%s", m.view.View(), m.input.View(), status)
+	// Status line: adds op-mode hint when active.
+	statusHint := "Ctrl-C to quit"
+	if m.creds.opMode {
+		statusHint = "op mode: [p]ause/resume selected bot, [j/k] move cursor, [r]efresh, Ctrl-C to quit"
+	}
+	status := systemStyle.Render(fmt.Sprintf("#%s -- %s -- %s", m.creds.channel, m.myName, statusHint)) + connState
+
+	chatView := m.view.View()
+	// In op mode, render the roster to the right of the chat view.
+	if m.creds.opMode {
+		chatView = joinLeftRight(chatView, m.renderRoster(), m.width)
+	}
+	return fmt.Sprintf("%s\n%s\n%s", chatView, m.input.View(), status)
+}
+
+// renderRoster builds the right-pane member list. Bots highlighted; a
+// [paused] badge appears next to any bot whose deliveries are currently
+// suspended. Highlighted row = rosterCursor.
+func (m *model) renderRoster() string {
+	if len(m.members) == 0 {
+		return rosterBox.Render(systemStyle.Render("(no members)"))
+	}
+	var b strings.Builder
+	b.WriteString(systemStyle.Render(fmt.Sprintf("members (%d)", len(m.members))))
+	b.WriteString("\n")
+	for i, mem := range m.members {
+		name := mem.DisplayName
+		if name == "" {
+			name = displayShort(mem.AccountID)
+		}
+		row := name
+		if mem.AccountType == "bot" {
+			row = botStyle.Render("@" + name)
+			if mem.IsGhost {
+				row += systemStyle.Render(" (ghost)")
+			}
+			if mem.Paused {
+				row += " " + pausedStyle.Render("[paused]")
+			}
+		}
+		if i == m.rosterCursor {
+			row = rosterCursorSt.Render(row)
+		}
+		b.WriteString(row)
+		b.WriteString("\n")
+	}
+	return rosterBox.Render(b.String())
+}
+
+// joinLeftRight lays two blocks side-by-side. Right pane is sized to a
+// fixed fraction of the total width so the chat view keeps most of the
+// space. Small enough to be safe on 80-col terminals.
+func joinLeftRight(left, right string, totalWidth int) string {
+	rightWidth := 28
+	if totalWidth > 0 && rightWidth > totalWidth/3 {
+		rightWidth = totalWidth / 3
+	}
+	leftBlock := lipgloss.NewStyle().Width(totalWidth - rightWidth - 1).Render(left)
+	rightBlock := lipgloss.NewStyle().Width(rightWidth).Render(right)
+	return lipgloss.JoinHorizontal(lipgloss.Top, leftBlock, rightBlock)
 }
 
 func displayShort(id string) string {

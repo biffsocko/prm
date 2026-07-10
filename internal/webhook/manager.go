@@ -50,6 +50,12 @@ type Manager struct {
 	// channel. Lets the broadcast hot path get matching subs without
 	// scanning the whole map.
 	byChannel map[uuid.UUID]map[uuid.UUID]struct{}
+	// pauses maps channel_id -> set of bot_account_ids whose deliveries on
+	// that channel are suspended by a channel operator (slice 6a). When a
+	// pause is present, Notify still runs the matcher but skips the fire —
+	// so the bot's subscriptions still exist, they just don't deliver.
+	// Built from storage at Reload, mutated by SetBotPaused / ClearBotPaused.
+	pauses map[uuid.UUID]map[uuid.UUID]struct{}
 }
 
 // Subscription is the live, compiled, mutable runtime form of a
@@ -127,6 +133,7 @@ func NewManager(store storage.Store, cfg Config, logger *slog.Logger) *Manager {
 		log:       logger,
 		subs:      make(map[uuid.UUID]*Subscription),
 		byChannel: make(map[uuid.UUID]map[uuid.UUID]struct{}),
+		pauses:    make(map[uuid.UUID]map[uuid.UUID]struct{}),
 		httpClient: &http.Client{
 			Timeout: cfg.HTTPTimeout,
 		},
@@ -148,6 +155,7 @@ func (m *Manager) Reload(ctx context.Context, tenants []*storage.Tenant) error {
 	defer m.mu.Unlock()
 	m.subs = make(map[uuid.UUID]*Subscription)
 	m.byChannel = make(map[uuid.UUID]map[uuid.UUID]struct{})
+	m.pauses = make(map[uuid.UUID]map[uuid.UUID]struct{})
 
 	for _, t := range tenants {
 		channels, err := m.store.ListChannels(ctx, t.ID)
@@ -170,9 +178,63 @@ func (m *Manager) Reload(ctx context.Context, tenants []*storage.Tenant) error {
 				m.indexByChannel(live)
 			}
 		}
+		// Channel-operator pauses live in a small per-tenant table (slice 6a).
+		pauses, err := m.store.ListChannelBotPauses(ctx, t.ID)
+		if err != nil {
+			return fmt.Errorf("reload: list pauses in %s: %w", t.Slug, err)
+		}
+		for _, p := range pauses {
+			m.setPausedLocked(p.ChannelID, p.BotAccountID, true)
+		}
 	}
-	m.log.Info("webhook manager reloaded", "subscriptions", len(m.subs))
+	m.log.Info("webhook manager reloaded",
+		"subscriptions", len(m.subs),
+		"pause_channels", len(m.pauses))
 	return nil
+}
+
+// SetBotPaused updates the in-memory pause set. Called by the server's
+// channel-operator handlers after they persist the pause row so subsequent
+// Notify calls see the change without a full Reload. paused=true installs
+// the pause; false clears it. Idempotent in both directions.
+func (m *Manager) SetBotPaused(channelID, botAccountID uuid.UUID, paused bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.setPausedLocked(channelID, botAccountID, paused)
+}
+
+// IsBotPaused reports whether the bot is currently paused on the channel.
+// Intended for tests and diagnostics; the hot path checks the pause set
+// inside Notify under the same lock as the subscription snapshot.
+func (m *Manager) IsBotPaused(channelID, botAccountID uuid.UUID) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	set, ok := m.pauses[channelID]
+	if !ok {
+		return false
+	}
+	_, paused := set[botAccountID]
+	return paused
+}
+
+func (m *Manager) setPausedLocked(channelID, botAccountID uuid.UUID, paused bool) {
+	if paused {
+		set, ok := m.pauses[channelID]
+		if !ok {
+			set = make(map[uuid.UUID]struct{}, 1)
+			m.pauses[channelID] = set
+		}
+		set[botAccountID] = struct{}{}
+		return
+	}
+	set, ok := m.pauses[channelID]
+	if !ok {
+		return
+	}
+	delete(set, botAccountID)
+	if len(set) == 0 {
+		delete(m.pauses, channelID)
+	}
 }
 
 func (m *Manager) indexByChannel(s *Subscription) {
@@ -279,6 +341,16 @@ func (m *Manager) Notify(ev Event) {
 			subs = append(subs, s)
 		}
 	}
+	// Snapshot the paused-bot set for this channel too, so the hot path
+	// can drop deliveries for paused bots without any further locking.
+	// Empty map when nothing is paused (common case; costs one nil check).
+	var paused map[uuid.UUID]struct{}
+	if pset, ok := m.pauses[ev.ChannelID]; ok && len(pset) > 0 {
+		paused = make(map[uuid.UUID]struct{}, len(pset))
+		for id := range pset {
+			paused[id] = struct{}{}
+		}
+	}
 	m.mu.RUnlock()
 
 	matcherEvent := matcher.Event{
@@ -290,7 +362,31 @@ func (m *Manager) Notify(ev Event) {
 		if !s.Matcher.Match(matcherEvent) {
 			continue
 		}
+		if _, isPaused := paused[s.AccountID]; isPaused {
+			// Match succeeded but delivery is suspended by a channel
+			// operator. Record a fire row so the audit trail explains
+			// the missing delivery; do NOT enqueue a task.
+			m.recordPausedFire(s)
+			continue
+		}
 		m.handleMatch(s, ev)
+	}
+}
+
+// recordPausedFire writes a "paused" status row into subscription_fires so
+// a caller reading the fire history can see that the subscription matched
+// but was suppressed by a channel-operator pause. Non-blocking; failures
+// are logged and swallowed since the delivery itself is already dropped.
+func (m *Manager) recordPausedFire(s *Subscription) {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	err := m.store.RecordSubscriptionFire(ctx, &storage.SubscriptionFire{
+		TenantID:       s.TenantID,
+		SubscriptionID: s.ID,
+		Status:         "paused",
+	})
+	if err != nil {
+		m.log.Warn("record paused fire failed", "err", err)
 	}
 }
 

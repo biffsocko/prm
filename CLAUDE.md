@@ -32,6 +32,14 @@ The standout design choice: **server-side filter pushdown for bot subscriptions.
   - **Chat history** (`internal/server/history.go`): every channel message is persisted off the hot path via a bounded-channel async writer with drop-on-full backpressure. New `chathistory` / `chathistory_ok` verbs return oldest-first with optional `before_ts` paging. Same path persists inbound integration events.
   - **Datadog + GitHub adapters**: typed inbound adapters for Datadog's Webhooks integration (configurable service tag) and GitHub events (push / pull_request / deployment_status / issues / release).
   - **Ghost-member indicator**: new `members` / `members_ok` verbs return the effective membership of a channel — live realtime connections plus any bot account with an active webhook subscription on the channel and no live connection (`is_ghost=true`). Each row carries `is_ghost` + `conn_count`.
+- **Channel-operator console v1 (slice 6a)**:
+  - New ACL role `channel_op` (owner/admin/member/banned/channel_op). Granted via existing `prmd admin grant <tenant> <channel> <user> channel_op` — no new API surface. Overt only (appears in `members_ok` like any other member).
+  - New verbs `chanop_pause_bot` / `chanop_resume_bot` / `chanop_ok`. Authorized off a cached role fetched at JOIN (no per-verb storage roundtrip). Same reject codes (`permission_denied`, `not_in_channel`, `not_a_bot`, etc.) as the existing surface.
+  - `channel_bot_pauses` + `channel_moderation_events` tables (SQLite full; Postgres stub). Every op action persists an audit row AND broadcasts a visible in-channel `msg` with `from_role="channel_op"` — audit-by-eye and audit-by-query both work.
+  - Webhook manager consults a per-channel in-memory pause set on Notify. A paused bot's subscriptions still MATCH; the fire is dropped with a `paused` row in `subscription_fires`. Pause suspends the bot's *actions*, not its ability to observe via a live connection.
+  - `Msg.FromRole` field added (backward-compatible; empty for regular members). `MemberInfo.Paused` bool so the TUI roster renders a `[paused]` badge.
+  - TUI operator mode: `prm --op` adds a right-pane roster + `p` to pause/resume the selected bot + `j/k` to move + `r` to refresh. `[op]` prefix on operator-authored messages.
+  - Explicitly deferred to 6b / 6c: `chanop_freeze`, `chanop_kick`, `chanop_delete_msg`, cross-channel operator dashboard. Operator + admin guide at [docs/OPERATORS.md](docs/OPERATORS.md).
 
 Future slices (federation, OAuth/SSO, Tier 3 active-active, file attachments) live in [DESIGN.md](DESIGN.md#implementation-slices) under "Slice 6+ — Deferred / future." Open questions from earlier slices (mention syntax, multi-device, ghost members) all resolved in slice 5.
 

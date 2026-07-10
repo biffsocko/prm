@@ -178,6 +178,29 @@ var migrations = []string{
 	) STRICT`,
 	`CREATE INDEX IF NOT EXISTS messages_channel_ts_idx ON messages(tenant_id, channel_id, ts)`,
 	`CREATE INDEX IF NOT EXISTS messages_ts_idx ON messages(ts)`,
+	`CREATE TABLE IF NOT EXISTS channel_bot_pauses (
+		tenant_id       TEXT NOT NULL,
+		channel_id      TEXT NOT NULL,
+		bot_account_id  TEXT NOT NULL,
+		paused_by       TEXT NOT NULL,
+		paused_at       INTEGER NOT NULL,
+		reason          TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY(tenant_id, channel_id, bot_account_id),
+		FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+	) STRICT`,
+	`CREATE INDEX IF NOT EXISTS channel_bot_pauses_tenant_idx ON channel_bot_pauses(tenant_id)`,
+	`CREATE TABLE IF NOT EXISTS channel_moderation_events (
+		id          TEXT PRIMARY KEY,
+		tenant_id   TEXT NOT NULL,
+		channel_id  TEXT NOT NULL,
+		actor_id    TEXT NOT NULL,
+		target_id   TEXT NOT NULL DEFAULT '',
+		action      TEXT NOT NULL,
+		reason      TEXT NOT NULL DEFAULT '',
+		at          INTEGER NOT NULL,
+		FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+	) STRICT`,
+	`CREATE INDEX IF NOT EXISTS channel_moderation_events_channel_at_idx ON channel_moderation_events(tenant_id, channel_id, at)`,
 }
 
 // CreateTenant inserts a new tenant. If t.ID is zero, a UUID v7 is generated.
@@ -1002,6 +1025,145 @@ func (s *Store) scanMessage(r scanner) (*storage.StoredMessage, error) {
 		TS:        time.UnixMicro(ts).UTC(),
 		CreatedAt: time.UnixMicro(createdAt).UTC(),
 	}, nil
+}
+
+// --- channel operator moderation (slice 6a) ---
+
+func (s *Store) SetChannelBotPause(ctx context.Context, p *storage.ChannelBotPause) error {
+	if p.TenantID == uuid.Nil || p.ChannelID == uuid.Nil || p.BotAccountID == uuid.Nil || p.PausedBy == uuid.Nil {
+		return fmt.Errorf("%w: tenant_id, channel_id, bot_account_id, paused_by required", storage.ErrInvalid)
+	}
+	if p.PausedAt.IsZero() {
+		p.PausedAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO channel_bot_pauses (tenant_id, channel_id, bot_account_id, paused_by, paused_at, reason)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(tenant_id, channel_id, bot_account_id) DO UPDATE SET
+		   paused_by = excluded.paused_by, paused_at = excluded.paused_at, reason = excluded.reason`,
+		p.TenantID.String(), p.ChannelID.String(), p.BotAccountID.String(),
+		p.PausedBy.String(), p.PausedAt.UnixMicro(), p.Reason)
+	if err != nil {
+		return fmt.Errorf("sqlite set channel_bot_pause: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) RemoveChannelBotPause(ctx context.Context, tenantID, channelID, botAccountID uuid.UUID) error {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM channel_bot_pauses WHERE tenant_id = ? AND channel_id = ? AND bot_account_id = ?`,
+		tenantID.String(), channelID.String(), botAccountID.String())
+	if err != nil {
+		return fmt.Errorf("sqlite remove channel_bot_pause: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) ListChannelBotPauses(ctx context.Context, tenantID uuid.UUID) ([]*storage.ChannelBotPause, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT tenant_id, channel_id, bot_account_id, paused_by, paused_at, reason
+		 FROM channel_bot_pauses WHERE tenant_id = ? ORDER BY paused_at`,
+		tenantID.String())
+	if err != nil {
+		return nil, fmt.Errorf("sqlite list channel_bot_pauses: %w", err)
+	}
+	defer rows.Close()
+	var out []*storage.ChannelBotPause
+	for rows.Next() {
+		var (
+			tid, cid, bid, by string
+			at                int64
+			reason            string
+		)
+		if err := rows.Scan(&tid, &cid, &bid, &by, &at, &reason); err != nil {
+			return nil, fmt.Errorf("sqlite scan channel_bot_pause: %w", err)
+		}
+		tuid, _ := uuid.Parse(tid)
+		cuid, _ := uuid.Parse(cid)
+		buid, _ := uuid.Parse(bid)
+		byuid, _ := uuid.Parse(by)
+		out = append(out, &storage.ChannelBotPause{
+			TenantID: tuid, ChannelID: cuid, BotAccountID: buid,
+			PausedBy: byuid, PausedAt: time.UnixMicro(at).UTC(), Reason: reason,
+		})
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) RecordModerationEvent(ctx context.Context, ev *storage.ModerationEvent) error {
+	if ev.TenantID == uuid.Nil || ev.ChannelID == uuid.Nil || ev.ActorID == uuid.Nil || ev.Action == "" {
+		return fmt.Errorf("%w: tenant_id, channel_id, actor_id, action required", storage.ErrInvalid)
+	}
+	if ev.ID == uuid.Nil {
+		id, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("sqlite: generate mod event id: %w", err)
+		}
+		ev.ID = id
+	}
+	if ev.At.IsZero() {
+		ev.At = time.Now().UTC()
+	}
+	targetStr := ""
+	if ev.TargetID != uuid.Nil {
+		targetStr = ev.TargetID.String()
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO channel_moderation_events (id, tenant_id, channel_id, actor_id, target_id, action, reason, at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		ev.ID.String(), ev.TenantID.String(), ev.ChannelID.String(),
+		ev.ActorID.String(), targetStr, string(ev.Action), ev.Reason, ev.At.UnixMicro())
+	if err != nil {
+		return fmt.Errorf("sqlite record moderation event: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListModerationEvents(ctx context.Context, tenantID, channelID uuid.UUID, limit int) ([]*storage.ModerationEvent, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, tenant_id, channel_id, actor_id, target_id, action, reason, at
+		 FROM channel_moderation_events WHERE tenant_id = ? AND channel_id = ?
+		 ORDER BY at DESC LIMIT ?`,
+		tenantID.String(), channelID.String(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite list moderation events: %w", err)
+	}
+	defer rows.Close()
+	var out []*storage.ModerationEvent
+	for rows.Next() {
+		var (
+			id, tid, cid, actor, target, action, reason string
+			at                                          int64
+		)
+		if err := rows.Scan(&id, &tid, &cid, &actor, &target, &action, &reason, &at); err != nil {
+			return nil, fmt.Errorf("sqlite scan moderation event: %w", err)
+		}
+		evID, _ := uuid.Parse(id)
+		tuid, _ := uuid.Parse(tid)
+		cuid, _ := uuid.Parse(cid)
+		auid, _ := uuid.Parse(actor)
+		var tuid2 uuid.UUID
+		if target != "" {
+			tuid2, _ = uuid.Parse(target)
+		}
+		out = append(out, &storage.ModerationEvent{
+			ID: evID, TenantID: tuid, ChannelID: cuid,
+			ActorID: auid, TargetID: tuid2,
+			Action: storage.ModerationAction(action), Reason: reason,
+			At: time.UnixMicro(at).UTC(),
+		})
+	}
+	return out, rows.Err()
 }
 
 // --- helpers ---
