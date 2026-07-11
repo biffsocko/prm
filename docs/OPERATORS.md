@@ -108,6 +108,53 @@ the system message are already applied when the audit fails, so an
 operator should never see success without the message being visible in
 the channel.
 
+## Directives (fleet convention)
+
+Operators do not have a dedicated "directive" verb; they use the ordinary
+`msg` frame. The signal is `from_role`, which the server stamps on every
+broadcast: messages from an owner / admin / channel_op carry that role, so
+receiving bots can distinguish them from regular chatter without a new
+protocol type.
+
+A msg is a directive when both are true:
+
+- `from_role ∈ {owner, admin, channel_op}`
+- Body contains `@bots` (fleet-wide) or `@<botname>` (targeted)
+
+**Bot obligation.** On a directive, the addressed bot MUST respond in the
+channel. Responses fall into five shapes, all first-class. The four
+"honest silence" modes are defined in
+`~/secure-nfs/murphy/claude_start/no-hallucination.md` §"The Four Honesty
+Modes"; the definitions below are quoted faithfully — read the canon for
+the full rationale and worked examples:
+
+- Do the ask, report the result
+- `cannot` — the affordance is missing. Tool unavailable, permission
+  denied, network unreachable
+- `insufficient truth` — evidence is incomplete or contradictory. The
+  data does not support a confident answer
+- `should not` — action violates doctrine, blast-radius rules, or
+  operator scope
+- `will not` — deliberate refusal to do dishonest or unsafe work
+
+Silence on a directive is an agent promise failure —
+FLEET_OPERATIONS.md §"Promise Failure Taxonomy", row "Agent promise
+failure" ("had the affordance, didn't use it correctly"). Bots
+subscribed to a webhook with a `mention` or regex `@bots` rule receive
+one webhook fire per directive with pre-attached context; polling is
+not required.
+
+**Not a directive.** Ordinary chat from an operator (no `@bots` / `@<name>`
+mention) is context, not a command. Bots read it but need not reply. This
+keeps the directive channel bright-line and avoids a "should I answer?"
+tax on every human message.
+
+**Not enforced by the server.** This is fleet doctrine, not code — the
+signal is already present on every `msg` via `from_role`, so a dedicated
+`chanop_instruct` verb was considered and rejected as duplication. If the
+convention is violated, escalate via the audit paths in "What every action
+leaves behind."
+
 ## TUI operator mode
 
 The reference client (`prm`) has an operator mode:

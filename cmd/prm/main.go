@@ -408,8 +408,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// normal typing (bare letters WOULD collide; we bind to
 			// runes that arrive via KeyRunes and only act when the
 			// input is empty so a chatting operator can still type "p"
-			// in a message).
+			// in a message). Returning early on a match consumes the
+			// key so it doesn't also land in the input buffer.
 			if m.creds.opMode && m.input.Value() == "" {
+				handled := true
 				switch msg.String() {
 				case "p":
 					m.togglePauseSelected()
@@ -424,6 +426,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "r":
 					// Manual roster refresh.
 					_ = m.cli.send(proto.Members{Channel: m.creds.channel})
+				default:
+					handled = false
+				}
+				if handled {
+					return m, nil
 				}
 			}
 		}
