@@ -84,6 +84,16 @@ func (c *Conn) handleMembers(ctx context.Context, m proto.Members) {
 	// already have a display name cached on the connection but no
 	// account type; we need a storage lookup for type. Ghost rows
 	// need both display name and type.
+	// Paused-bot lookup for the roster: consult the webhook manager's
+	// in-memory pause set. Only bot rows can be paused; humans always
+	// report Paused=false.
+	isPaused := func(accountID uuid.UUID, accType string) bool {
+		if accType != string(storage.AccountBot) || c.srv.webhooks == nil {
+			return false
+		}
+		return c.srv.webhooks.IsBotPaused(ch.ID, accountID)
+	}
+
 	infos := make([]proto.MemberInfo, 0, len(live)+len(ghostAccountIDs))
 	for accountID, a := range live {
 		acc, err := c.srv.store.GetAccountByID(ctx, c.tenantID, accountID)
@@ -101,6 +111,7 @@ func (c *Conn) handleMembers(ctx context.Context, m proto.Members) {
 			AccountType: accountType,
 			IsGhost:     false,
 			ConnCount:   a.count,
+			Paused:      isPaused(accountID, accountType),
 		})
 	}
 	for accountID := range ghostAccountIDs {
@@ -116,6 +127,7 @@ func (c *Conn) handleMembers(ctx context.Context, m proto.Members) {
 			AccountType: string(acc.Type),
 			IsGhost:     true,
 			ConnCount:   0,
+			Paused:      isPaused(accountID, string(acc.Type)),
 		})
 	}
 

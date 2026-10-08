@@ -224,6 +224,12 @@ func frameForType(t string) (Frame, error) {
 		return &Members{}, nil
 	case TypeMembersOK:
 		return &MembersOK{}, nil
+	case TypeChanopPauseBot:
+		return &ChanopPauseBot{}, nil
+	case TypeChanopResumeBot:
+		return &ChanopResumeBot{}, nil
+	case TypeChanopOK:
+		return &ChanopOK{}, nil
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownType, t)
 	}
@@ -285,6 +291,12 @@ func derefFrame(f Frame) Frame {
 	case *Members:
 		return *v
 	case *MembersOK:
+		return *v
+	case *ChanopPauseBot:
+		return *v
+	case *ChanopResumeBot:
+		return *v
+	case *ChanopOK:
 		return *v
 	default:
 		return f

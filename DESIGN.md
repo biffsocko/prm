@@ -52,6 +52,8 @@ The `type` field is mandatory and selects the schema for the remaining fields. `
 | `presence` | S→C | Member join/leave/role-change events |
 | `ping` / `pong` | C↔S | Keepalive (server initiates, client echoes) |
 | `error` | S→C | Generic error frame |
+| `chanop_pause_bot` / `chanop_resume_bot` | C→S | Channel-operator moderation (slice 6a): suspend/resume one bot's webhook deliveries on this channel |
+| `chanop_ok` | S→C | Success reply for chanop verbs |
 
 The catalog will grow but stays small. Anything bot-related (subscription management, webhook secrets, etc.) lives on the REST control plane, not the realtime protocol.
 
@@ -122,7 +124,9 @@ Each channel has:
 - `name` — human-readable, mutable, not unique
 - `owner_id` — account UUID
 - `visibility` — `private` (must be in ACL to join) or `public` (any authenticated account may join)
-- `acl` — list of `(account_id, role)` pairs where role ∈ {`owner`, `admin`, `member`, `banned`}
+- `acl` — list of `(account_id, role)` pairs where role ∈ {`owner`, `admin`, `member`, `banned`, `channel_op`}
+
+`channel_op` (slice 6a) is a moderation role: read + send + issue channel-operator verbs (currently `chanop_pause_bot` / `chanop_resume_bot`; freeze / kick / delete-msg follow in later slices). An account granted `channel_op` on a channel appears in `members_ok` like any other member — this role is **overt**, not covert. Owner and admin can also moderate; `channel_op` exists so an account can be granted moderation authority without ownership. See [docs/OPERATORS.md](docs/OPERATORS.md).
 
 Joining requires:
 
@@ -414,6 +418,8 @@ All domain tables include `tenant_id uuid not null` as the first column, indexed
 - `subscription_fires` (tenant_id, subscription_id, fired_at, status, attempts) — for budget accounting and debugging
 - `integrations` (id, tenant_id, channel_id, adapter, token_hash, settings_json, disabled_at, ...)
 - `platform_admins` (account_id, granted_at) — global, cross-tenant; intentionally not tenant-scoped
+- `channel_bot_pauses` (tenant_id, channel_id, bot_account_id, paused_by, paused_at, reason) — slice 6a: channel-operator suspensions of a bot's webhook deliveries; primary key is the composite of (tenant, channel, bot)
+- `channel_moderation_events` (id, tenant_id, channel_id, actor_id, target_id, action, reason, at) — slice 6a: append-only audit log of every channel-operator action (paired with a visible in-channel system message)
 
 Composite indexes lead with `tenant_id`. Queries always scope by `tenant_id` first; the storage-package API enforces this at the function signature.
 
@@ -598,6 +604,16 @@ Slicing the build so each step ships something useful and validates the next:
 - **Datadog + GitHub adapters**: Datadog Webhooks (configurable service-tag), GitHub events (push / pull_request / deployment_status / issues / release).
 - **Ghost-member indicator**: new `members` / `members_ok` verbs return the effective membership of a channel — live realtime connections plus any bot account with an active webhook subscription on the channel that has no live connection. Each row carries `is_ghost` + `conn_count`.
 - Tagged **v1.0.0** on GitHub.
+
+**Slice 6a — Channel-operator console (v1). ✅ Implemented.**
+- New ACL role `channel_op` in `channel_acl.role`; granted via existing `prmd admin grant <tenant> <channel> <user> channel_op`. Satisfies `CanJoin()` (private-channel access) and `CanModerate()` (permission to issue chanop verbs).
+- New realtime verbs: `chanop_pause_bot` / `chanop_resume_bot` / `chanop_ok`. Authz is a cached role check on the connection (filled at JOIN), so no storage roundtrip per verb.
+- `channel_bot_pauses` + `channel_moderation_events` tables (SQLite full, Postgres stub). Every action persists a moderation-event row AND broadcasts a visible in-channel `msg` with `from_role="channel_op"` — audit-by-eye and audit-by-query both work.
+- Webhook manager: in-memory per-channel pause set built at Reload, mutated by `SetBotPaused`. A paused bot's subscriptions still MATCH; the fire is dropped with a `paused` row in `subscription_fires` so the audit trail explains the missing delivery. Bots keep receiving via a live connection — pause suspends *actions*, not observation.
+- `Msg.FromRole` field added (backward-compatible; empty for regular members). `MemberInfo.Paused` added so the TUI roster can render a `[paused]` badge.
+- TUI operator mode (`prm --op`): adds a right-pane roster with bot rows highlighted; keybind `p` pauses/resumes the selected bot when the input line is empty; `j/k` move the cursor; `r` refreshes on demand.
+- E2E test (`test/e2e/chanop_pause_test.go`) proves the full loop: baseline fire → operator pauses → next match does NOT fire → regina (non-op) is denied → operator resumes → next match fires; audit rows land in correct order.
+- Explicitly deferred to 6b / 6c: `chanop_freeze`, `chanop_kick`, `chanop_delete_msg`, cross-channel operator dashboard.
 
 **Slice 6+ — Deferred / future.**
 - Multi-device session policy hardening (currently allows N concurrent connections; need explicit session-list verb + force-kick).

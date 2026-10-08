@@ -137,3 +137,18 @@ func (*Store) ListMessages(context.Context, uuid.UUID, uuid.UUID, int, time.Time
 func (*Store) PurgeMessagesOlderThan(context.Context, time.Duration) (int, error) {
 	return 0, ErrNotImplemented
 }
+func (*Store) SetChannelBotPause(context.Context, *storage.ChannelBotPause) error {
+	return ErrNotImplemented
+}
+func (*Store) RemoveChannelBotPause(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error {
+	return ErrNotImplemented
+}
+func (*Store) ListChannelBotPauses(context.Context, uuid.UUID) ([]*storage.ChannelBotPause, error) {
+	return nil, ErrNotImplemented
+}
+func (*Store) RecordModerationEvent(context.Context, *storage.ModerationEvent) error {
+	return ErrNotImplemented
+}
+func (*Store) ListModerationEvents(context.Context, uuid.UUID, uuid.UUID, int) ([]*storage.ModerationEvent, error) {
+	return nil, ErrNotImplemented
+}

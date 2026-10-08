@@ -20,6 +20,7 @@ import (
 	"github.com/biffsocko/prm/internal/channels"
 	"github.com/biffsocko/prm/internal/mention"
 	"github.com/biffsocko/prm/internal/proto"
+	"github.com/biffsocko/prm/internal/storage"
 	"github.com/biffsocko/prm/internal/webhook"
 )
 
@@ -78,6 +79,13 @@ type Conn struct {
 	// handlePart so the hot path doesn't touch storage. Accessed only from
 	// the read goroutine (single-threaded per conn), so no lock needed.
 	joinedChannels map[string]uuid.UUID
+	// joinedRoles caches the sender's ACL role in each joined channel,
+	// looked up once at JOIN time. Used by handleMsg to stamp FromRole on
+	// broadcast frames without a storage hit; also consulted by the
+	// channel-operator handlers to authorize moderation actions. Empty
+	// string when the account has no ACL entry (public-channel case) —
+	// which correctly disallows moderation for non-ACL'd members.
+	joinedRoles map[string]storage.ChannelRole
 
 	log *slog.Logger
 }
@@ -94,6 +102,7 @@ func newConn(srv *Server, raw net.Conn) *Conn {
 		out:            make(chan []byte, outboundQueueSize),
 		pongCh:         make(chan string, 4),
 		joinedChannels: make(map[string]uuid.UUID, 4),
+		joinedRoles:    make(map[string]storage.ChannelRole, 4),
 		log:            srv.log.With("conn", id.String()[:8]),
 	}
 }
@@ -229,6 +238,10 @@ func (c *Conn) dispatch(ctx context.Context, f proto.Frame) {
 		c.handleChatHistory(ctx, v)
 	case proto.Members:
 		c.handleMembers(ctx, v)
+	case proto.ChanopPauseBot:
+		c.handleChanopPauseBot(ctx, v)
+	case proto.ChanopResumeBot:
+		c.handleChanopResumeBot(ctx, v)
 	default:
 		c.sendError("unsupported", fmt.Sprintf("verb %q not supported", f.FrameType()), "")
 	}
@@ -464,6 +477,14 @@ func (c *Conn) handleJoin(ctx context.Context, j proto.Join) {
 	// Cache the channel id on the connection for fast lookup in
 	// handlePart / handleMsg.
 	c.joinedChannels[j.Channel] = channel.ID
+	// Cache the ACL role for FromRole stamping and moderation authz.
+	// A missing ACL row on a public channel is fine — it maps to empty
+	// role, which stamps no FromRole badge and disallows moderation.
+	if entry, err := c.srv.store.GetChannelACL(ctx, c.tenantID, channel.ID, c.accountID); err == nil {
+		c.joinedRoles[j.Channel] = entry.Role
+	} else {
+		c.joinedRoles[j.Channel] = ""
+	}
 
 	ch := c.srv.channels.GetOrCreate(c.tenantID, channel.ID, j.Channel)
 	added := ch.AddMember(c)
@@ -489,6 +510,7 @@ func (c *Conn) handlePart(ctx context.Context, p proto.Part) {
 		return
 	}
 	delete(c.joinedChannels, p.Channel)
+	delete(c.joinedRoles, p.Channel)
 	ch := c.srv.channels.Get(c.tenantID, chanID)
 	if ch == nil {
 		return
@@ -526,13 +548,17 @@ func (c *Conn) handleMsg(ctx context.Context, m proto.Msg) {
 		c.sendError("not_in_channel", "channel no longer in memory; rejoin", m.ID)
 		return
 	}
-	// Server-stamp From + TS, encode the broadcast frame once, fan out.
+	// Server-stamp From + TS + FromRole, encode the broadcast frame once,
+	// fan out. FromRole is populated for roles that clients may want to
+	// render distinctively (owner / admin / channel_op); empty for regular
+	// members and for public-channel senders with no ACL entry.
 	now := time.Now().UTC()
 	out := proto.Msg{
-		Channel: m.Channel,
-		From:    c.accountID.String(),
-		TS:      now,
-		Body:    m.Body,
+		Channel:  m.Channel,
+		From:     c.accountID.String(),
+		FromRole: displayFromRole(c.joinedRoles[m.Channel]),
+		TS:       now,
+		Body:     m.Body,
 	}
 	bytes, err := proto.EncodeBytes(out)
 	if err != nil {

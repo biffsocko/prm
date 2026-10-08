@@ -7,6 +7,7 @@
 //	prmd admin create-account [--password PW] [--bot] [--display-name NAME] [--storage URL] <tenant-slug> <username>
 //	prmd admin create-channel [--public] [--storage URL] <tenant-slug> <channel-name> <owner-username>
 //	prmd admin grant [--storage URL] <tenant-slug> <channel-name> <username> <role>
+//	  role: owner | admin | member | banned | channel_op
 //	prmd admin revoke [--storage URL] <tenant-slug> <channel-name> <username>
 //	prmd admin issue-token [--label LABEL] [--storage URL] <tenant-slug> <bot-username>
 //	prmd admin revoke-token [--storage URL] <tenant-slug> <token-id>
@@ -425,15 +426,15 @@ func cmdGrant(args []string) int {
 	_ = fs.Parse(args)
 	if fs.NArg() != 4 {
 		fmt.Fprintln(os.Stderr, "usage: prmd admin grant [flags] <tenant-slug> <channel-name> <username> <role>")
-		fmt.Fprintln(os.Stderr, "  role: owner | admin | member | banned")
+		fmt.Fprintln(os.Stderr, "  role: owner | admin | member | banned | channel_op")
 		return 2
 	}
 	tenantSlug, channelName, username, roleStr := fs.Arg(0), fs.Arg(1), fs.Arg(2), fs.Arg(3)
 	role := storage.ChannelRole(roleStr)
 	switch role {
-	case storage.RoleOwner, storage.RoleAdmin, storage.RoleMember, storage.RoleBanned:
+	case storage.RoleOwner, storage.RoleAdmin, storage.RoleMember, storage.RoleBanned, storage.RoleChannelOp:
 	default:
-		fmt.Fprintf(os.Stderr, "invalid role %q; must be owner | admin | member | banned\n", roleStr)
+		fmt.Fprintf(os.Stderr, "invalid role %q; must be owner | admin | member | banned | channel_op\n", roleStr)
 		return 2
 	}
 
